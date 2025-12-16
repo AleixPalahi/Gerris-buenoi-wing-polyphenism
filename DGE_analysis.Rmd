@@ -1,0 +1,3047 @@
+---
+title: "EdgeR DEG analysis using FeatureCounts output"
+output: html_notebook
+---
+
+Notes: This is a work in progress R script that aims to make EdgeR DEG analysis as simple and automated as possible using featureCounts outputs. Default edgeR parameters include TMM normalization and both QLF and LRT tests. It uses on one hand a correspondance file with the following structure on each line: order,name,file_name,correspondance,group_1,group_2,group_3,group_4 Like for example: 1,A2-18-1,A2-18-1.bam,A_4E_18_2,A,4E,18,2 Please note that file_name should correspond to the column name of the featureCounts file and we do not need the actual bam file. Also, in order to automate as much as possible the analysis the design contrast is automatically generated assuming that: Group1=Species; Group2=Stade; Group3=Condition; Group4=Replicate TO DO: Describe how the desired contrasts can be obtained from the options. The other needed file is either a single featureCounts output file containing columns for all the samples, or individual featureCounts output files for each sample.
+
+Script initially by David Armisen, later modified by Aleix Palahí. The original source can be found in: <https://gitlab.com/davidarmisen/edger-deg-analysis-using-featurecounts-output>
+
+If you use this work, please cite this repository.
+
+
+Change working directory
+
+```{r}
+setwd("~/Library/CloudStorage/OneDrive-Uppsalauniversitet/PhD/Research/G.buenoi-DGE")
+```
+
+Define general options \# Those options are fully implemented right now
+
+```{r}
+load_data_only=1 # 1=Yes -> If I run the chunks only data will be loaded but not unnecessary calculations
+print_onscreen=0 # 0=No -> If I just want to print all graphs in a save file BUT NOT 'onscreen'. This should significantly improve speed.
+```
+
+Load libraries
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(edgeR)
+library(data.table)
+library(RColorBrewer)
+library(gplots)
+library(gtools)
+library(ggalt)
+library(GGally)
+library(UpSetR)
+library(venn)
+library(eulerr)
+library(readxl)
+library(topGO)
+library(ggrepel)
+library(gridExtra)
+library(ggpubr)
+library(statmod)
+```
+
+# Create functions : Some are new like TPM and others are made to simply all the combinatory analysis (samples & projects)
+
+Custom Functions
+
+```{r}
+# TPM function
+# michael's version
+# https://support.bioconductor.org/p/91218/
+##############
+
+tpm <- function(x) { # From formula in https://www.biostars.org/p/322114/ . Same results as my tpm.DGEList function
+  y<-as.data.frame(rpkm(x))
+  return(t(t(y)*1e6/colSums(y)))
+}
+
+tpm.default <- function(counts,len,log=FALSE) {
+  x <- counts/len
+  y <- t(t(x)*1e6/colSums(x))
+  if (log){
+    y<-log2(y)
+  }
+  return(y)
+}
+
+tpm.DGEList <- function (y, gene.length = NULL, normalized.lib.sizes = TRUE, log = FALSE, prior.count = 2, ...){
+    if (is.character(gene.length)) {
+        gene.length <- y$genes[[gene.length[1]]]
+        if (is.null(gene.length))
+            stop("gene.length column not found")
+    } else {
+        if (is.null(gene.length))
+            gene.length <- y$genes$Length
+        if (is.null(gene.length))
+            gene.length <- y$genes$length
+        if (is.null(gene.length)) {
+            j <- grep("length", tolower(names(y$genes)))
+            if (length(j) == 1)
+                gene.length <- y$genes[, j]
+            else stop("Gene lengths not found")
+        }
+    }
+  
+    cnt = y$counts
+    len = gene.length 
+    
+    norm.factors <- y$samples
+    for (i in colnames(cnt)){
+        cnt[,i]<-cnt[,i]*norm.factors[i,"norm.factors"]
+    }
+    
+    tpm.default(counts=cnt,len=len,log=log)
+}
+
+# https://stats.stackexchange.com/questions/3051/mean-of-a-sliding-window-in-r
+# http://coleoguy.blogspot.com/2014/04/sliding-window-analysis.html
+slideFunct <- function(data, window, step){
+    total <- length(data)
+    spots <- seq(from=1, to=(total-window), by=step)
+    if (spots[length(spots)]<=total-window){spots<-c(spots,(spots[length(spots)]+step))} # Adapted to recover the last bits inside smaller window
+    result <- vector(length = length(spots))
+    for(i in 1:length(spots)){
+      if ((spots[i]+window)>=total){window=(total-spots[i])} # Adapted to recover the last bits inside last smaller window 
+      result[i] <- mean(data[spots[i]:(spots[i]+window-1)])
+    }
+    return(result)
+  }
+slideFunctDistance <- function(data1, window, step){
+    total <- nrow(data1)
+    spots <- seq(from=1, to=(total-window), by=step)
+    if (spots[length(spots)]<=total-window){spots<-c(spots,(spots[length(spots)]+step))} # Adapted to recover the last bits inside smaller window
+    result <- vector(length = length(spots))
+    for(i in 1:length(spots)){
+      if ((spots[i]+window)>=total){window=(total-spots[i])} # Adapted to recover the last bits inside last smaller window 
+      if (window!=0){result[i] <- data1[(spots[i]+window-1)]$Mean-data1[spots[i]]$Mean}
+      if (window==0){result[i] <- data1[spots[i]]$Mean}  # In case our group consists on a single gene
+    }
+    return(result)
+  }
+
+######################
+# Read files functions
+######################
+dag_load_files<-function(
+  correspondance_file=NULL,
+  functional_annotation_file=NULL,
+  chromosome_size_file=NULL,
+  subgenomes_file=NULL,
+  gff3_file=NULL
+){
+  # Start empty variables to return them later
+  correspondance<-NULL
+  functional_annotation<-NULL
+  chrom_size<-NULL
+  subgenomes<-NULL
+  gff_annotation<-NULL
+  gene_coordinates<-NULL
+
+  # Read correspondance's file
+  if (length(correspondance_file)!=0){
+    correspondance=fread(correspondance_file,header=TRUE,sep=",")
+    # Format : order	name	file_name	correspondance	group_1	group_2	group_3	group_4
+    
+    #Define NEW samples names adapted for simplified analysis: Species_Stade_Condition_Replicate
+    correspondance$new_name = c(paste0(correspondance$group_1,"_",correspondance$group_2,"_",correspondance$group_3,"_",correspondance$group_4))
+  }  
+
+  # Read functional annotation
+  if (length(functional_annotation_file)!=0){
+    functional_annotation=read.csv(file=functional_annotation_file,header=TRUE,sep ="\t")
+    functional_annotation<-as.data.table(functional_annotation)
+    functional_annotation$Simp.Gene.ID <-gsub("\\.[0-9]*$","",functional_annotation$Gene.ID,perl=TRUE)
+  }
+  
+  
+  # Chromosomes size 
+  if (length(chromosome_size_file)!=0){
+    chrom_size=read.csv(file=chromosome_size_file,header=TRUE,sep ="\t")
+  }
+  
+  # Chromosomes subgenomes if any 
+  if (length(subgenomes_file)!=0){
+    subgenomes=read.csv(file=subgenomes_file,header=FALSE,sep ="\t")
+    for(i in 1:nrow(subgenomes)){
+      assign(paste0(subgenomes[i,]$V1),as.vector(strsplit(subgenomes[i,]$V2,","))[[1]])
+    }
+  }
+    
+  # Load annotations
+  if (length(gff3_file)!=0){
+    gff_annotation<-read.delim(gff3_file, header=F, comment.char="#")
+    gff_annotation<-as.data.table(gff_annotation)
+    colnames(gff_annotation)<-c("seqid","source","type","start","end","score","strand","phase","attributes")
+  }
+  
+    
+  
+  # Gene coordinates
+  if (length(gff3_file)!=0){
+    x=fread(gff3_file,header=FALSE,sep="\t")
+    colnames(x)<-c("Chromosome","Source","Type","Start","End","6","Strand","8","Gene")
+    x$Gene=(gsub(".*ID=","",x$Gene, perl=TRUE))
+    x$Gene=(gsub(";.*","",x$Gene, perl=TRUE))
+    gene_coordinates<-x
+    gene_coordinates$Mean=rowMeans(gene_coordinates[,c(4,5)])
+  }
+  
+  
+  return(list(correspondance=correspondance,
+              functional_annotation=functional_annotation,
+              chrom_size=chrom_size,
+              subgenomes=subgenomes,
+              gff_annotation=gff_annotation,
+              gene_coordinates=gene_coordinates
+  ))
+}
+
+# Read files and summarize mapped reads to RefSeq genes : Put counts into DGEList
+dag_readfiles <- function(files, readsfolder=NULL, readsprefix=NULL, readssufix=NULL,correspondance=NULL,consolidateprojectreads=NULL,gene_coordinates=NULL,reduceprojectreads=NULL,columns_or_file_names="file") {
+  for (l in 1:length(files)){
+    i=files[l]
+
+    j=""  
+    for (fol in readsfolder){
+      for (pre in readsprefix){
+        for (suf in readssufix){
+          t=paste0(fol,pre,i,suf)
+          if (file.exists(t)){
+            j=t
+          }
+          else (print(paste0("Error: files ",t," doesn't exists")))
+        } 
+      }      
+    }
+
+    y=fread(j,header=TRUE,sep="\t",na.strings=".",skip=1)
+    colnames(y)[1:6]<-c("Geneid","Chr","Start","End","Strand","Length")
+
+    ##########################################
+    # Filter out here once for all ChrUn genes
+    y<-y[!y$Chr %like% "chrUn",]
+    ##########################################
+
+    for (ll in 7:length(colnames(y))){
+      lll<-colnames(y)[ll]
+      colnames(y)[ll]<-"sample"
+      if (l==1 & ll==7){
+        counts<-y[,c("Geneid","sample")]
+        genes<-y[,c("Geneid","Length")]
+        colnames(y)[ll]<-lll
+      } else {
+        counts<-merge(counts,y[,c("Geneid","sample")], by="Geneid",all=TRUE);counts[is.na(counts)] <- 0
+        if (y[,c("Geneid")] %in% genes[,c("Geneid")]){ # If we have new genes. i.e. reading samples from another a bam with only subgenome D and another from a bam with subgenome ABD
+          genes<-merge(genes,y[!y$Geneid %in% genes$Geneid,c("Geneid","Length")], by=c("Geneid","Length"),all=TRUE)
+        }
+        colnames(y)[ll]<-lll
+      }
+      if (columns_or_file_names %in% "file"){
+        i<-correspondance[correspondance$file_name %in% i , "correspondance"] # This allow to fix samples problems like i.e. Langdon 500T1 250T2
+        names(counts)[names(counts) == 'sample'] <- as.character(i$correspondance) # I had to do this and use an intermediate 'sample' name because merge doesn't want to use a variable i directly. Need to check this in the future
+      }
+      else if (columns_or_file_names %in% "columns"){
+        i<-correspondance$correspondance[correspondance$file_name %in% lll]
+        names(counts)[names(counts) == 'sample'] <- as.character(i) # I had to do this and use an intermediate 'sample' name because merge doesn't want to use a variable i directly. Need to check this in the future
+      }
+    }
+  }
+
+  # Used it we have multiple copies of the same data. Developed to take into account original unsuccessful sequencing of brachy as well as the redone sequencing
+  if (length(consolidateprojectreads)!=0){ 
+    temp<-as.data.frame(counts)
+    rownames(temp)<-temp[,"Geneid"]
+    temp<-temp[,!colnames(temp) %in% "Geneid"]
+    
+    colnames(temp)<-gsub(consolidateprojectreads,"",colnames(temp),perl=TRUE)
+    temp2<-unique(colnames(temp))
+  
+    temp<-t(rowsum(t(temp), group = colnames(temp), na.rm = T)) # https://stackoverflow.com/questions/35626945/row-wise-sum-of-values-grouped-by-columns-with-same-name
+    temp<-as.data.frame(temp)
+    temp[,"Geneid"]<-rownames(temp)
+    temp<-as.data.table(temp)
+    PROJECT_files<-temp2
+    temp2<-c("Geneid",temp2)
+    counts<-  temp[,..temp2]
+  }
+  
+  # Changes samples names
+  x<-colnames(counts[,2:ncol(counts)])
+  y<-correspondance[correspondance %in% x,c("correspondance","new_name")]
+  t<-y[match(x, y$correspondance),]$new_name
+  colnames(counts)<-c("Geneid",t)
+  t<-sort(t)
+  t<-c("Geneid",t)
+  counts<-counts[,..t]
+  #
+  projectreads<-dag_readsummary(counts=counts,lengths=genes,files=PROJECT_files,correspondance_files=correspondance)
+  if (length(gene_coordinates)!=0){
+    projectreads$genes<-unique(merge(projectreads$genes,gene_coordinates[Gene %in% projectreads$genes$Geneid,c("Chromosome","Gene")],by.x="Geneid",by.y="Gene"))
+  }
+  if (length(reduceprojectreads)!=0){
+    projectreads <- projectreads[, colnames(projectreads[,colnames(projectreads) %like% reduceprojectreads]) , keep.lib.sizes=FALSE]
+  }
+  rownames(projectreads$genes)<-projectreads$genes$Geneid
+ 
+  # Make sure order of genes is the same in projectreads$genes is the same as in projectreads$counts. Otherwise we can have problems later when filtering with keep
+  projectreads$genes<-projectreads$genes[sort(projectreads$genes$Geneid),]
+  projectreads$counts<-projectreads$counts[sort(projectreads$genes$Geneid),]
+  
+  return(projectreads)
+}
+
+# Read summarization. Summarize mapped reads to RefSeq genes. This will just take a few seconds. Note that the featureCounts function has built-in annotation for Refseq genes. featureCounts returns an R 'List' object, which includes raw read count for each gene in each library and also annotation information for genes such as gene identifiers and gene lengths. 
+dag_readsummary <- function(counts,lengths,files,groups="",correspondance_files=NULL){
+  Geneid<-counts$Geneid
+  counts$Geneid<-NULL
+  counts<-as.matrix(counts)
+  rownames(counts)<-Geneid
+  
+  i<-NULL
+  if (length(groups)==1){
+    i<-gsub("_[0-9]*$","",colnames(counts),perl=TRUE);
+  } else {i<-groups}
+  groups=factor(i)
+  t<-DGEList(counts = counts, genes=lengths, group=groups)
+
+  tt<-correspondance_files[correspondance_files$new_name %in% colnames(counts),]
+  
+  # Add some information about samples i.e. species, stage, condition, replicate... 
+  if (!is.null(correspondance_files$group_1)){t$group1<-data.frame(group=as.character(tt$group_1),row.names=tt$new_name)}
+  if (!is.null(correspondance_files$group_2)){t$group2<-data.frame(group=as.character(tt$group_2),row.names=tt$new_name)}
+  if (!is.null(correspondance_files$group_3)){t$group3<-data.frame(group=as.character(tt$group_3),row.names=tt$new_name)}
+  if (!is.null(correspondance_files$group_4)){t$group4<-data.frame(group=as.character(tt$group_4),row.names=tt$new_name)}
+      
+  return(t)
+}
+
+# Filter genes by n method reads in m libraries and/or select the most highly expressed ones
+# select data for the 'select' most highly expressed genes and decide if return the original or the transformed selection
+dag_selectgenes <- function(data,gene.length=NULL,method="Raw",min=0,libraries=0,select=0,original=1,prior.count=2){
+  check=0
+  if(!is.null(names(data))){ # To avoid errors due to null values in next evaluation
+    if(as.data.table(names(data)) %like% "counts"){ # Use DGEfile which allow also for calc.norm normaliztion in CPM, TPM and RPKM
+      if (method=="Raw"){transfcounts <- data$counts}
+      else if (method=="CPM"){transfcounts <- cpm(data,prior.count=prior.count)}
+      else if (method=="TPM"){transfcounts <- tpm.DGEList(data,prior.count=prior.count)}
+      else if (method=="RPKM"){transfcounts <- rpkm(data,prior.count=prior.count)}
+      if (log==TRUE){transfcounts<-log2(transfcounts+1)}
+    }
+    else {print(paste("There is an error in input data type"))}
+  }
+  else {
+    if (method=="Raw"){transfcounts <- data}
+    else if (method=="CPM"){transfcounts <- cpm(data,prior.count=prior.count)}
+    else if (method=="TPM"){transfcounts <- tpm.default(data,gene.length=gene.length,prior.count=prior.count)}
+    else if (method=="RPKM"){transfcounts <- rpkm(data,gene.length=gene.length,prior.count=prior.count)}
+    if (log==TRUE){transfcounts<-log2(transfcounts+1)}
+  }
+
+  # Filter those genes which had >'min' 'method' reads in at least 'libraries' libraries.
+  transfcounts <- transfcounts[(rowSums(transfcounts >= min) >= libraries),]
+  counts<-transfcounts
+
+  datas<-data
+  
+  if (original==0){ #  Modify to return the calculated values
+    datas <- counts  # If I already calculated CPM, TPM, RPKM I no longer need DGElist object
+  }
+
+  if (select!=0){resultscounts <- datas[order(rowMeans(counts), decreasing=TRUE)[1:select],]}
+  else {resultscounts <- datas[rownames(counts),]}
+
+  return(resultscounts)
+}
+
+# To simplify groups when we have extracted a subset from our main DEGList data object
+dag_simplify_groups<-function(data){ # It also reorder columns
+    keep<-colnames(data$counts)
+    data$group1$sample<-rownames(data$group1);data$group1<-data$group1[rownames(data$group1) %in% keep,];rownames(data$group1)<-data$group1$sample
+    data$group2$sample<-rownames(data$group2);data$group2<-data$group2[rownames(data$group2) %in% keep,];rownames(data$group2)<-data$group2$sample
+    data$group3$sample<-rownames(data$group3);data$group3<-data$group3[rownames(data$group3) %in% keep,];rownames(data$group3)<-data$group3$sample
+    data$group4$sample<-rownames(data$group4);data$group4<-data$group4[rownames(data$group4) %in% keep,];rownames(data$group4)<-data$group4$sample
+    
+    return(data)
+}
+
+################################
+# Define and create folders name 
+################################
+dag_folders_name<-function(prefix,prefix2,subgenome="none",filtermin,filterminlib,filter_low,padjusted){
+  name=paste0(prefix)
+
+  folder=paste0("outputs_",filtermin,"_",filterminlib,"_",filter_low,"_",prefix2,"_",padjusted,"/")
+  folderPCA<-paste0(folder,"PCA/")
+  folderData<-paste0(folder,"data/")
+  folderUpset<-paste0(folder,"Upset-Venn/")
+  folderedgeR<-paste0(folder,"edgeR/")
+  folderDensities<-paste0(folder,"Densities/")
+  folderGO<-paste0(folder,"GO/")
+  folderAdditivity<-paste0(folder,"Additivity/")
+  folderDynamic<-paste0(folder,"Dynamic/")
+    
+  dir.create(folder, showWarnings = FALSE)
+  dir.create(folderPCA, showWarnings = FALSE)
+  dir.create(folderData, showWarnings = FALSE)
+  dir.create(folderUpset, showWarnings = FALSE)
+  dir.create(folderedgeR, showWarnings = FALSE)
+  dir.create(folderDensities, showWarnings = FALSE)
+  dir.create(folderGO, showWarnings = FALSE)
+  dir.create(folderAdditivity, showWarnings = FALSE)
+  dir.create(folderDynamic, showWarnings = FALSE)
+  
+  return(list(name=name,
+              folder=folder,
+              folderPCA=folderPCA,
+              folderData=folderData,
+              folderUpset=folderUpset,
+              folderedgeR=folderedgeR,
+              folderDensities=folderDensities,
+              folderGO=folderGO,
+              folderAdditivity=folderAdditivity,
+              folderDynamic=folderDynamic
+  ))
+}
+
+#######
+# Plots
+#######
+dag_expressed_genes_plot <- function(data,gene.length=NULL,min=0,libraries=0,select=0,original=0,prior.count=2,
+                                     name=NA,
+                                     method1="Raw",min1=0,logbase1=0,
+                                     method2="CPM",min2=1,logbase2=0,
+                                     folder,
+                                     print_onscreen=0
+                            ){
+  genes<-gff_annotation[type=="gene"]
+  genes$Traes<-gsub(".*ID=","",genes$attribute)
+  genes$Traes<-gsub(";.*","",genes$Traes)
+  
+  genes_count = data.table(
+    chr = c(unique(genes$seqid)),
+    total = 0
+  )
+  genes_count$chr<-unique(genes$seqid)
+  for (j in colnames(data)){
+    genes_count[,paste0(j)]<-c(1:length(unique(genes$seqid)))
+  }
+
+  genes_count_2<-genes_count
+
+  datas<-dag_selectgenes(data,gene.length,method = method1,min=min,libraries,select,original,prior.count)
+  datas2<-dag_selectgenes(data,gene.length,method = method2,min=min,libraries,select,original,prior.count)
+  
+  if (logbase1!=0){datas<-log(datas+1,base=logbase1)}
+  if (logbase2!=0){datas<-log(datas2+1,base=logbase2)}  
+
+  rownames(datas)<-gsub("\\..*","",rownames(datas))
+  rownames(datas2)<-gsub("\\..*","",rownames(datas2))
+
+  for (i in genes_count$chr){  
+    print(paste(i,"",length(genes[seqid==i]$Traes)))
+    genes_count_2[chr==i]$total<-length(genes[seqid==i]$Traes)
+    genes_count[chr==i]$total<-length(genes[seqid==i]$Traes)
+    for (j in colnames(datas)){
+      genes_count[chr==i][[j]]<-sum(datas[genes[seqid==i & Traes %in% rownames(datas)]$Traes,j]>min1)
+      genes_count_2[chr==i][[j]]<-sum(datas2[genes[seqid==i & Traes %in% rownames(datas2)]$Traes,j]>min2)
+    }
+  }
+  
+  x<-as.data.frame(genes_count)
+  rownames(x)<-as.vector(genes_count$chr)
+  x$total=NULL
+  x$chr=NULL
+
+  y<-as.data.frame(genes_count_2)
+  rownames(y)<-as.vector(genes_count_2$chr)
+  y$total=NULL
+  y$chr=NULL
+
+  c<-ceiling(max(genes_count[,!c("chr","total")])+max(genes_count[,!c("chr","total")])*0.02)
+
+  if (print_onscreen==1 | is.na(name)){
+    n<-barplot(genes_count$total,ylim=c(0,c),col=c("#b2abd2"), border="white", space=0.01, main=paste0(name," ",method1,">",min1," ",method2,">",min2), xlab="", ylab="# Genes",axisnames=FALSE)
+    m<-boxplot(t(x),ylim=c(0,c), col="#e66101", at=n, add=TRUE, main="", xlab="", ylab="", names=FALSE, frame=FALSE)
+    boxplot(t(y),ylim=c(0,c), col="#fdb863", at=n, add=TRUE, main="", xlab="", ylab="", names=FALSE, frame=FALSE)
+    #axis(2)
+    axis(1,at=n,labels=rownames(x),las=2,cex.axis=0.8)
+  }
+  
+  if (!is.na(name)){
+    jpeg(paste0(folder,"expressed_genes_plot_",name,".jpg"), width = 960, height = 960);
+      n<-barplot(genes_count$total,ylim=c(0,c),col=c("#b2abd2"), border="white", space=0.01, main=paste0(name," ",method1,">",min1," ",method2,">",min2), xlab="", ylab="# Genes",axisnames=FALSE)
+      m<-boxplot(t(x),ylim=c(0,c), col="#e66101", at=n, add=TRUE, main="", xlab="", ylab="", names=FALSE, frame=FALSE)
+      boxplot(t(y),ylim=c(0,c), col="#fdb863", at=n, add=TRUE, main="", xlab="", ylab="", names=FALSE, frame=FALSE)
+      #axis(2)
+      axis(1,at=n,labels=rownames(x),las=2,cex.axis=0.8)
+    dev.off()
+  }
+}
+
+# Density plot of read counts
+dag_densityplot_pergene <- function(data,gene.length=NULL,method="Raw",logbase=0,min=0,libraries=0,select=0,original=0,prior.count=2,minreads=1,name=NA,folder){
+  logcounts<-as.matrix(dag_selectgenes(data,gene.length,method,min,libraries,select,original,prior.count))
+  if (logbase!=0){logcounts<-log(logcounts+1,base=logbase)}
+
+  d <- density(logcounts[,1])
+  
+  if (logbase==0){plot(d,xlim=c(minreads,8),main=name,ylim=c(0,0.4),xlab=paste0(method," counts per gene"), ylab="Density")}
+  else {plot(d,xlim=c(minreads,8),main=name,ylim=c(0,0.4),xlab=paste0(method," counts per gene (log",logbase,")"), ylab="Density")}
+  
+  if (ncol(data)>1){
+    for (s in 2:ncol(data)){
+      d <- density(logcounts[,s])
+      lines(d)
+    }
+  }
+  
+  if (!is.na(name)){
+    jpeg(paste0(folder,"density_plot_of_reads_counts_",name,".jpg"), width = 960, height = 960);
+    logcounts[logcounts==-Inf]<-min(logcounts[logcounts!=-Inf])
+    d <- density(logcounts[,1])
+    if (logbase==0){plot(d,xlim=c(minreads,8),main=name,ylim=c(0,0.4),xlab=paste0(method," counts per gene"), ylab="Density")}
+    else {plot(d,xlim=c(minreads,8),main=name,ylim=c(0,0.4),xlab=paste0(method," counts per gene (log",logbase,")"), ylab="Density")}
+    
+    if (ncol(data)>1){
+      for (s in 2:ncol(data)){
+        d <- density(logcounts[,s])
+        lines(d)
+      }
+    }
+    dev.off()
+  }
+}
+
+# Box plot of read counts 
+### Need to adapt logbase
+dag_boxplot_pergene <- function(data,gene.length=NULL,method="Raw",logbase=0,min=0,libraries=0,select=0,original=0,prior.count=2,minreads=1,name=NA,folder){
+  if (print_onscreen==1 | is.na(name)){
+    logcounts<-as.matrix(dag_selectgenes(data,gene.length,method,min,libraries,select,original,prior.count))
+    if (logbase!=0){logcounts<-log(logcounts+1,base=logbase)}
+
+    d <- density(logcounts[,1])
+  
+    if (logbase==0){boxplot(logcounts, main=name, xlab="", ylab=paste0(method," counts per gene"),axes=FALSE)}
+    else {boxplot(logcounts, main=name, xlab="", ylab=paste0(method," counts per gene (log",logbase,")"),axes=FALSE)}
+    
+    axis(2)
+    axis(1,at=c(1:ncol(data)),labels=colnames(logcounts),las=2,cex.axis=0.8)
+  }
+  if (!is.na(name)){
+    jpeg(paste0(folder,"box_plot_of_reads_counts_",name,".jpg"), width = 960, height = 960);
+    logcounts<-as.matrix(dag_selectgenes(data,gene.length,method,min,libraries,select,original,prior.count))
+    if (logbase!=0){logcounts<-log(logcounts+1,base=logbase)}
+    
+    d <- density(logcounts[,1])
+
+    if (logbase==0){boxplot(logcounts, main=name, xlab="", ylab=paste0(method," counts per gene"),axes=FALSE)}
+    else {boxplot(logcounts, main=name, xlab="", ylab=paste0(method," counts per gene (log",logbase,")"),axes=FALSE)}
+    
+    axis(2)
+    axis(1,at=c(1:ncol(data)),labels=colnames(logcounts),las=2,cex.axis=0.8)
+    dev.off()
+  }
+}
+
+# PCA : Classical multidimensional scaling (MDS) of a data matrix. Also known as principal coordinates analysis (Gower, 1966).
+# If using eucledian distances to calculate the dissimilarity, it becames identical to calculate a PCA: clustering based on minimizing the linear distances is the same maximizing the linear correlations:  https://www.youtube.com/watch?v=GEn-_dAyYME
+dag_PCA <- function(data,name=NA,folder,print_onscreen=0,width=1800,height=1800,quality=100,res=300){
+  # transpose the data to have variables (genes) as columns
+  data_for_PCA <- t(data)
+
+  ## calculate MDS (matrix of dissimilarities) # Performs Classical multidimensional scaling (MDS) of a data matrix. Also known as principal coordinates analysis (Gower, 1966)
+  # k = the maximum dimension of the space which the data are to be represented in
+  # eig = indicates whether eigenvalues should be returned
+  k=nrow(data_for_PCA)-1 # Actually it doesn't change the results from k=2 (and it's slower to compute) but it allow us to recover mds 3 and 4
+  mds <- cmdscale(dist(data_for_PCA), k=k, eig=TRUE)  
+
+  # The variable mds$eig provides the Eigen values for the first 8 principal components:
+  #mds$eig
+  
+  # transform the Eigen values into percentage
+  eig_pc <- mds$eig * 100 / sum(mds$eig)
+  if (k>7){n<-sum(eig_pc[7:length(eig_pc)]);eig_pc<-eig_pc[1:7];eig_pc[7]<-n} # To avoid displaying too much data which reduces font size too much
+  # plot the PCA
+  if (print_onscreen==1 | is.na(name)){
+    barplot(eig_pc, las=1, xlab=paste0("Dimensions (",length(mds$eig),")"), ylab="Proportion of explained variance (%)", y.axis=NULL, col="darkgrey",names.arg = round(eig_pc,2))
+  
+    #Samples representation
+    if (k>=4){
+      plot(mds$points[,3], -mds$points[,4], type="n", xlab="Dimension 3", ylab="Dimension 4", main=name)
+      text(mds$points[,3], -mds$points[,4], rownames(mds$points), cex=0.8)
+    }
+    
+    if (k>=2){
+      plot(mds$points[,1], -mds$points[,2], type="n", xlab="Dimension 1", ylab="Dimension 2", main=name)
+      text(mds$points[,1], -mds$points[,2], rownames(mds$points), cex=0.8)
+    }
+  }
+  
+  if (!is.na(name)){
+    jpeg(paste0(folder,"PCA_barplot_",name,".jpg"),width = width, height = height,quality=quality,res=res);
+    barplot(eig_pc, las=1, xlab=paste0("Dimensions (",length(mds$eig),")"), ylab="Proportion of explained variance (%)", y.axis=NULL, col="darkgrey",names.arg = round(eig_pc,2))
+    dev.off()
+  }
+  
+  return(mds)
+}
+
+# MDS.DGElist : Plot samples on a two-dimensional scatterplot so that distances on the plot approximate the expression differences between the samples.This function is a variation on the usual multdimensional scaling (or principle coordinate) plot. The default method (method="logFC") is to convert the counts to log-counts-per-million using cpm and to pass these to the limma plotMDS function. This method calculates distances between samples based on log2 fold changes.
+#dag_MDS.DGElist <- function(data,groupingby){
+dag_MDS.DGElist <- function(data){
+  mds<-plotMDS.DGEList(data, method="logFC")
+  return(mds)
+}
+
+dag_nice_PCA_MDS <- function(mds,name=NA,groupingby="group_1",axislabel="",folder,colours=NA,shapes=NA,width = 10, height = 10, res=300, units=c("cm"),withnames=0){
+  if (ncol(mds$points)>=2){
+    # transform the Eigen values into percentage
+    eig_pc <- round((mds$eig * 100 / sum(mds$eig)),2)
+  
+    mds_df<-as.data.frame(cbind(mds$points[,1],mds$points[,2]))
+    mds_df[,"Sample"]<-rownames(mds_df)
+   
+    if (groupingby=="group_1"){
+              mds_df<-merge(mds_df,correspondance[new_name %in% rownames(mds_df),c("new_name","group_1")],by.x = "Sample",by.y="new_name")
+              names(mds_df)[names(mds_df) == 'group_1'] <- 'group'
+        } else if (groupingby=="group_2"){
+              mds_df<-merge(mds_df,correspondance[new_name %in% rownames(mds_df),c("new_name","group_2")],by.x = "Sample",by.y="new_name")
+              names(mds_df)[names(mds_df) == 'group_2'] <- 'group'  
+        } else if (groupingby=="group_3"){
+              mds_df<-merge(mds_df,correspondance[new_name %in% rownames(mds_df),c("new_name","group_3")],by.x = "Sample",by.y="new_name")
+              names(mds_df)[names(mds_df) == 'group_3'] <- 'group'  
+        } else if (groupingby=="group_4"){
+              mds_df<-merge(mds_df,correspondance[new_name %in% rownames(mds_df),c("new_name","group_4")],by.x = "Sample",by.y="new_name")
+              names(mds_df)[names(mds_df) == 'group_4'] <- 'group'
+        } else {
+              mds_df$group<-rownames(mds_df)
+              setcolorder(mds_df, c("Sample", "V1", "V2","group"))
+              rownames(mds_df)<-NULL
+    }
+    mds_df$group<-as.character(mds_df$group)
+    
+    xlabel=print(paste(axislabel,"PC1 (",eig_pc[1]," %)"))
+    ylabel=print(paste(axislabel,"PC2 (",eig_pc[2]," %)"))
+    colnames(mds_df)<-c("Sample","PC1","PC2","Group")
+    
+    mds_df$Group <- factor(mds_df$Group, levels = as.character(mixedsort(unique(mds_df$Group)))) # This function replaces much better what I wanted to do above
+
+    d <- ggplot(mds_df, aes(PC1,PC2, col=Group)) + geom_point(aes(shape=Group),size=2) + scale_shape_manual(values=rep(0:25,5))
+    if (groupingby!="none"){
+      for (i in unique(mds_df$Group)){
+        d <- d + geom_encircle(data=mds_df[mds_df$Group==i,],aes(x=PC1,y=PC2))
+      }
+    }
+    d <- d + labs(title=name) + xlab(xlabel) + ylab(ylabel)
+
+    dnames <- ggplot(mds_df, aes(PC1,PC2, col=Group)) + 
+                scale_shape_manual(values=rep(0:25,5))+
+                geom_text(label=mds_df$Sample, size=2) +
+                labs(title=name) + xlab(xlabel) + ylab(ylabel)
+        
+    if (length(colours)!=1){
+      d <- d + scale_colour_manual(values=colours)
+      dnames <- dnames + scale_colour_manual(values=colours)
+    }
+    if (length(shapes)!=1){
+      d <- d + scale_shape_manual(values=shapes)
+      dnames <- dnames + scale_shape_manual(values=shapes)
+    }
+    
+
+    
+    if (!is.na(name)){
+      n<-paste0(folder,"PCA_MDS_PC1_PC2_",name,"_",groupingby,".jpg")
+      d<-dag_addSmallLegend(d)
+      ggsave(filename=n, plot=d, width=width, height=height,dpi=res,units=units)
+      
+      if ((groupingby=="group_1" & withnames %in% c(1,3,5,9,7,11,13)) |
+          (groupingby=="group_2" & withnames %in% c(2,3,6,10,7,11,14)) |
+          (groupingby=="group_3" & withnames %in% c(4,5,6,12,7,13,14)) |
+          (groupingby=="group_4" & withnames %in% c(8,9,10,12,11,13,14))){
+        n<-paste0(folder,"PCA_MDS_PC1_PC2_",name,"_",groupingby,"_with_names.jpg")
+        dnames<-dag_addSmallLegend(dnames)
+        ggsave(filename=n, plot=dnames, width=width, height=height,dpi=res,units=units)
+      }
+    }
+  
+
+    if (ncol(mds$points)>=4){
+      mds_dff<-as.data.frame(cbind(mds$points[,3],mds$points[,4]))
+      mds_dff[,"Sample"]<-rownames(mds_dff)
+  
+      if (groupingby=="group_1"){
+              mds_dff<-merge(mds_dff,correspondance[new_name %in% rownames(mds_dff),c("new_name","group_1")],by.x = "Sample",by.y="new_name")
+              names(mds_dff)[names(mds_dff) == 'group_1'] <- 'group'
+        } else if (groupingby=="group_2"){
+              mds_dff<-merge(mds_dff,correspondance[new_name %in% rownames(mds_dff),c("new_name","group_2")],by.x = "Sample",by.y="new_name")
+              names(mds_dff)[names(mds_dff) == 'group_2'] <- 'group'  
+        } else if (groupingby=="group_3"){
+              mds_dff<-merge(mds_dff,correspondance[new_name %in% rownames(mds_dff),c("new_name","group_3")],by.x = "Sample",by.y="new_name")
+              names(mds_dff)[names(mds_dff) == 'group_3'] <- 'group'  
+        } else if (groupingby=="group_4"){
+              mds_dff<-merge(mds_dff,correspondance[new_name %in% rownames(mds_dff),c("new_name","group_4")],by.x = "Sample",by.y="new_name")
+              names(mds_dff)[names(mds_dff) == 'group_4'] <- 'group'
+        } else {
+              mds_dff$group<-rownames(mds_dff)
+              setcolorder(mds_dff, c("Sample", "V1", "V2","group"))
+              rownames(mds_dff)<-NULL
+      }
+      mds_dff$group<-as.character(mds_dff$group)
+  
+      xlabel=print(paste(axislabel,"PC3 (",eig_pc[3]," %)"))
+      ylabel=print(paste(axislabel,"PC4 (",eig_pc[4]," %)"))
+      colnames(mds_dff)<-c("Sample","PC3","PC4","Group")
+  
+      mds_dff$Group <- factor(mds_dff$Group, levels = as.character(mixedsort(unique(mds_dff$Group)))) # This function replaces much better what I wanted to do above
+      
+      dd <- ggplot(mds_dff, aes(PC3,PC4, col=Group)) + geom_point(aes(shape=Group),size=2) + scale_shape_manual(values=rep(0:25,5))
+      if (groupingby!="none"){
+        for (i in unique(mds_dff$Group)){
+          dd <- dd + geom_encircle(data=mds_dff[mds_dff$Group==i,],aes(x=PC3,y=PC4))
+        }
+      }
+      dd <- dd + labs(title=name) + xlab(xlabel) + ylab(ylabel)
+      
+      ddnames <- ggplot(mds_dff, aes(PC3,PC4, col=Group)) + 
+                scale_shape_manual(values=rep(0:25,5))+
+                geom_text(label=mds_dff$Sample, size=2) +
+                labs(title=name) + xlab(xlabel) + ylab(ylabel)
+      
+      if (length(colours)!=1){
+        dd <- dd + scale_colour_manual(values=colours)
+        ddnames <- ddnames + scale_colour_manual(values=colours)
+      }
+      if (length(shapes)!=1){
+        dd <- dd + scale_shape_manual(values=shapes)
+        ddbnames <- ddnames + scale_shape_manual(values=shapes)
+      }
+      
+      if (!is.na(name)){
+        n<-paste0(folder,"PCA_MDS_PC3_PC4_",name,"_",groupingby,".jpg")
+        dd<-dag_addSmallLegend(dd)
+        ggsave(filename=n, plot=dd, width=width, height=height,dpi=res,units=units)
+        
+        if ((groupingby=="group_1" & withnames %in% c(1,3,5,9,7,11,13)) |
+          (groupingby=="group_2" & withnames %in% c(2,3,6,10,7,11,14)) |
+          (groupingby=="group_3" & withnames %in% c(4,5,6,12,7,13,14)) |
+          (groupingby=="group_4" & withnames %in% c(8,9,10,12,11,13,14))){
+          n<-paste0(folder,"PCA_MDS_PC3_PC4_",name,"_",groupingby,"_with_names.jpg")
+          ddnames<-dag_addSmallLegend(ddnames)
+          ggsave(filename=n, plot=ddnames, width=width, height=height,dpi=res,units=units)
+        }          
+      }
+  
+      if (print_onscreen==1 | is.na(name)){
+        dd
+        if ((groupingby=="group_1" & withnames %in% c(1,3,5,9,7,11,13)) |
+            (groupingby=="group_2" & withnames %in% c(2,3,6,10,7,11,14)) |
+            (groupingby=="group_3" & withnames %in% c(4,5,6,12,7,13,14)) |
+            (groupingby=="group_4" & withnames %in% c(8,9,10,12,11,13,14))){ddnames}
+      }
+    }
+    if (print_onscreen==1 | is.na(name)){
+      d
+      if ((groupingby=="group_1" & withnames %in% c(1,3,5,9,7,11,13)) |
+          (groupingby=="group_2" & withnames %in% c(2,3,6,10,7,11,14)) |
+          (groupingby=="group_3" & withnames %in% c(4,5,6,12,7,13,14)) |
+          (groupingby=="group_4" & withnames %in% c(8,9,10,12,11,13,14))){dnames}
+    }
+    
+    if (ncol(mds$points)<4){dd=d}
+    return(list(d,dd))
+  }
+}
+
+# Function retrieved from https://stackoverflow.com/questions/52297978/decrease-overal-legend-size-elements-and-text to add a smaller legend
+dag_addSmallLegend <- function(myPlot, pointSize = 0.5, textSize = 3, spaceLegend = 0.1) {
+    myPlot +
+        guides(shape = guide_legend(override.aes = list(size = pointSize)),
+               color = guide_legend(override.aes = list(size = pointSize))) +
+        theme(legend.title = element_text(size = textSize), 
+              legend.text  = element_text(size = textSize),
+              legend.key.size = unit(spaceLegend, "lines"))
+}
+
+dag_heatmap2 <- function(data,method="Raw",break1=0,break2=10,tracecol="cyan",nbreaks=100, hclust_method="average",name=NA,folder,print_onscreen=0){
+  # hclust_method = the agglomeration method to be used. This should be (an unambiguous abbreviation of) one of "ward.D", "ward.D2", "single", "complete", "average" (= UPGMA), "mcquitty" (= WPGMA), "median" (= WPGMC) or "centroid" (= UPGMC).
+  # Define the palette: from red to yellow to green with as many intermediate colors as breaks we are going to ask later. This creates enough gradient to avoid visualization biases due to low number of colours -> too quick shift from green to yellow to red
+  my_palette <- colorRampPalette(c("#A50026", "#FFFFBF", "#006837"))(n = nbreaks)
+
+  if (print_onscreen==1 | is.na(name)){
+    heatmap.2(data, col=my_palette, tracecol=tracecol, hclustfun = function(x) hclust(x,method=hclust_method), breaks = seq(break1,break2,length.out=(nbreaks+1)),key.title = name, cexCol=0.8)
+  }
+  
+  if (!is.na(name)){
+    jpeg(paste0(folder,"heatmap_",name,".jpg"), width = 960, height = 960);
+    heatmap.2(data, col=my_palette, tracecol=tracecol, hclustfun = function(x) hclust(x,method=hclust_method), breaks = seq(break1,break2,length.out=(nbreaks+1)),key.title = name, cexCol=0.8)
+    dev.off()
+  }
+}
+
+# Heatmap sample to sample
+dag_heatmap_sample_to_sample <- function(data,tracecol="cyan",nbreaks=100,hclust_method="average",name=NA,folder,print_onscreen=0){
+  # hclust_method = the agglomeration method to be used. This should be (an unambiguous abbreviation of) one of "ward.D", "ward.D2", "single", "complete", "average" (= UPGMA), "mcquitty" (= WPGMA), "median" (= WPGMC) or "centroid" (= UPGMC).
+  # Define the palette: from red to yellow to green with as many intermediate colors as breaks we are going to ask later. This creates enough gradient to avoid visualization biases due to low number of colours -> too quick shift from green to yellow to red
+  my_palette <- colorRampPalette(c("#A50026", "#FFFFBF", "#006837"))(n = nbreaks)
+
+  sampleDists <- dist(t(data))
+  sampleDistMatrix <- as.matrix(sampleDists)
+  colnames(sampleDistMatrix)<-rownames(sampleDistMatrix)
+  if (print_onscreen==1 | is.na(name)){
+    heatmap.2(sampleDistMatrix, col=my_palette, tracecol=tracecol, hclustfun = function(x) hclust(x,method=hclust_method),key.title = name, cexCol=0.8)
+  }
+  
+  if (!is.na(name)){
+    jpeg(paste0(folder,"heatmap_sample_to_sample_",name,".jpg"), width = 1080, height = 1080, quality=100);
+    heatmap.2(sampleDistMatrix, col=my_palette, tracecol=tracecol, hclustfun = function(x) hclust(x,method=hclust_method),key.title = name, cexCol=0.8)
+    dev.off()
+  }
+}
+
+# An adaptation to my own 
+dag_ggpairs_own_points <- function(data, mapping, print_onscreen=0, ...){
+      x = data
+
+      X <- gsub('`','',mapping[1]);X <- gsub('~','',X)
+      Y <- gsub('`','',mapping[2]);Y <- gsub('~','',Y)
+      
+      X <- data[,as.character(gsub('~','',X))]
+      Y <- data[,as.character(gsub('~','',Y))]
+      
+      cols=densCols(X , Y, colramp=colorRampPalette(rev(brewer.pal(11,name="RdYlGn")), space="Lab"))
+      p <-  ggplot(x, aes(x = X, y = Y)) +
+            xlab(colnames(x)[1]) +
+            ylab(colnames(x)[2]) +
+            geom_point(color=cols,size=0.1)
+      if (print_onscreen==1 | is.na(name)){p}
+
+      p
+}
+
+dag_ggpairs_own_hex <- function(data, name, mapping, print_onscreen=0, ...){
+        x = data
+        
+        X <- gsub('`','',mapping[1]);X <- gsub('~','',X)
+        Y <- gsub('`','',mapping[2]);Y <- gsub('~','',Y)
+      
+        X <- data[,as.character(gsub('~','',X))]
+        Y <- data[,as.character(gsub('~','',Y))]
+      
+        cols=densCols(X , Y, colramp=colorRampPalette(rev(brewer.pal(11,name="RdYlGn")), space="Lab"))
+        p <-  ggplot(x, aes(x = X, y = Y)) +
+            xlab(colnames(x)[1]) +
+            ylab(colnames(x)[2]) +
+            scale_fill_gradientn(colours = rev(brewer.pal(11,name="RdYlGn"))) +
+            stat_binhex(bins=64,aes(fill=log(..count..)),na.rm = TRUE)
+        if (print_onscreen==1 | is.na(name)){p}
+
+        p
+}
+
+
+
+dag_stackplot<-function(i,name="",folder="",expressed_only=0,print_onscreen=0){
+  i[i<1]=0;i[i>=1 & i<2]=1;i[i>=2 & i<3]=2;i[i>=3 & i<4]=3;i[i>=4 & i<5]=4;i[i>=5 & i<6]=5;i[i>=6 & i<7]=6;i[i>=7 & i<8]=7;i[i>=8 & i<9]=8;i[i>=9 & i<10]=9;i[i>=10]=10
+  # I have to do it in two steps because if not it stops working at second subsitution: maybe it passes from numerical to character? Need to check in the future
+  i[i==0]="<1";i[i==1]="1-2";i[i==2]="2-3";i[i==3]="3-4";i[i==4]="4-5";i[i==5]="5-6";i[i==6]="6-7";i[i==7]="7-8";i[i==8]="8-9";i[i==9]="9-10";i[i==10]=">10"
+  j=gather(as.data.table(i))
+
+  y<-as.matrix(table(j))
+  y<-y[c(colnames(i)),] # Reorder rows
+  
+  if(expressed_only==1){y<-y[,2:11]} # Remove <1 line
+  
+  if (ncol(y)==11){y<-y[,c("<1","1-2","2-3","3-4","4-5","5-6","6-7","7-8","8-9","9-10",">10")]} # Reorder columns
+  if (ncol(y)==10){y<-y[,c("1-2","2-3","3-4","4-5","5-6","6-7","7-8","8-9","9-10",">10")]} # Reorder columns
+  
+  x=as.data.frame(as.table(y))
+  t<-ggplot(x, aes(fill=value, y=Freq, x=key)) + geom_bar( stat="identity", position=position_fill(reverse=TRUE)) + scale_fill_discrete(guide =  guide_legend(reverse=TRUE)) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle(name)
+  if (print_onscreen==1 | is.na(name)){t}
+
+  if (!is.na(name)){
+    n<-paste0(folder,name,"_stackplot.jpg")
+    if (expressed_only==1){n<-paste0(folder,name,"_stackplot_expressed_only.jpg")}
+    ggsave(filename=n, plot=t, width=8, height = 6)
+  }
+}
+
+
+dag_ridgelineplot<-function(i,xlim=25,log=FALSE,name=NA,folder){
+  j=gather(as.data.table(i))
+  if (log!=FALSE){
+    j[j$value==0,]$value<-NA
+    j$value<-log(j$value,log)
+    t<-ggplot(j,aes(x=value,y=key,fill=key)) + geom_density_ridges() + theme_ridges() + theme(legend.position = "none") + ggtitle(name)
+  }
+  else {
+    t<-ggplot(j,aes(x=value,y=key,fill=key)) + xlim(0,xlim) + geom_density_ridges() + theme_ridges() + theme(legend.position = "none") + ggtitle(name)
+  }
+  if (print_onscreen==1 | is.na(name)){t}
+
+  if (!is.na(name)){
+    n<-paste0(folder,"ridgelineplot_",name,".jpg")
+    ggsave(filename=n, plot=t, width=8, height = 6)
+  }
+}
+
+
+dag_plot_FDR<-function(data,folder="",name=""){
+  g<-ggplot(data=data, aes(PValue))+geom_histogram(bins=200,fill="white",color="black")
+  x<-ggplot_build(g)$data[[1]][[1]]
+  x<-x[length(x)]
+  g <- g + geom_hline(aes(yintercept=x),color="red") +
+          geom_vline(aes(xintercept=0.05),color="green") +
+          ggtitle(paste0("PValue ",name)) +
+          ylab("Genes") + xlab("PValue")
+  n<-paste0(folder,"plot_Pvalue_histogram_",name,".jpeg")
+  ggsave(filename=n, plot=g)
+  
+  g<-ggplot(data=data, aes(FDR))+geom_histogram(bins=200,fill="white",color="black")
+  x<-ggplot_build(g)$data[[1]][[1]]
+  x<-x[length(x)]
+  g <- g + geom_hline(aes(yintercept=x),color="red") +
+          geom_vline(aes(xintercept=0.05),color="green") +
+          ggtitle(paste0("FDR ",name)) +
+          ylab("Genes") + xlab("FDR")
+  n<-paste0(folder,"plot_FDR_histogram_",name,".jpeg")
+  ggsave(filename=n, plot=g)
+  
+  # To automatically adjust the x ticks
+  x<-nchar(nrow(data)) # Get the number of characters of maximum value to display
+  y<-paste0("1",paste(replicate(x-1, "0"), collapse = "")) # Define the new tick separation
+  
+  data<-data[order(data$PValue),]
+  data$orderp<-1:nrow(data)
+  data<-data[order(data$FDR),]
+  data$orderf<-1:nrow(data)
+  
+  g<-ggplot() + geom_line(data=data,aes(x=orderp,y=PValue)) +
+                 geom_line(data=data,aes(x=orderf,y=FDR),linetype = "dashed") +
+                 geom_hline(aes(yintercept=0.05),color="green") +
+                 scale_x_continuous(breaks=seq(0, nrow(data), by = as.integer(y))) +
+                 ggtitle(paste0("PValue (solid) vs FDR (dashed) ",name)) +
+                 ylab("Value") + xlab("Order")
+  n<-paste0(folder,"plot_Pvalue_vs_FDR_",name,".jpeg")
+  ggsave(filename=n, plot=g)
+}
+
+dag_volcano <- function(data,FDR_val=0.01,logFC_val=1,genes=NA,name=NA,filename=NA){
+  t<-data$table
+
+  g<-ggplot(t,aes(x=logFC,y=-log10(PValue)))+
+    geom_point(color="grey") +
+    geom_point(data=t[t$FDR<=FDR_val & t$logFC<=-1*logFC_val,],color="blue") + 
+    geom_point(data=t[t$FDR<=FDR_val & t$logFC>=logFC_val,],color="red")
+  
+  if (!is.na(genes)){
+    if (genes %in% "FDR"){
+      g <- g + geom_text_repel(data=t[t$FDR<=FDR_val & (t$logFC<=-1*logFC_val | t$logFC>=logFC_val),],
+                    aes(label = Geneid),
+                    min.segment.length = unit(0, 'lines'),
+                    max.overlaps=50,
+                    nudge_y = 0.1)
+    } else {
+      if (!is.na(genes) & sum(!genes %in% t$Geneid)!=0){ # If not all genes are present in Geneid
+        print(paste0("ATTENTION: A list of geneids has been provided to highlight in Volcano plot but no all of them are present in the data. Please Check it up."))
+      }
+ 
+      g <- g + geom_text_repel(data=t[t$Geneid %in% genes,],
+                    aes(label = Geneid),
+                    min.segment.length = unit(0, 'lines'),
+                    max.overlaps=50,
+                    nudge_y = 0.1)
+    }
+  }
+    
+  g <- g + xlim(-ceiling(max(abs(t$logFC))),ceiling(max(abs(t$logFC))))+theme_bw() 
+  #+ theme_classic()
+  #+ theme_bw()
+  if (!is.na(file)){
+    ggsave(filename=filename, plot=g)
+  } else {
+    g
+  }
+}
+
+########
+# dag_DE
+########
+dag_DE<-function(data,
+         name=NA, # Analysis name
+         folder=folder, # Folder name to save results
+         filter="cpm",filtermin=5,filterminlib=3, # Lowly expressed genes filter
+         normmethod="TMM", # Normalization method
+         highly_expressed=1000, # Highly expressed genes
+         plot_PCA_highly=TRUE, # Plot highly expressed genes PCA
+         use="cpm", # Shall we use cpm, tpm or rpkm for future plots
+         break1=0,break2=0,tracecol = NA, hclust_method = "complete", # Heatmap
+         plot_pairs_heatmap="no", # Pairs heatmap
+         padjusted=padjusted,
+         dispmethod="pooled",
+         DEGonly=DEGonly,
+         runedgeR=runedgeR,
+         per_chromosome=0,
+         groupingby=NULL,
+         design=design,
+         contrasts=contrasts,
+         used=NULL,
+         fgroup=NULL,
+         toppro=20, # Number of top genes to print profile
+         topclust=50, # Number of top genes to print cluster
+         print_onscreen=0,
+         model_method=dag_model_method, # Both = QLF and LRT; QLF = QLF ; LRT = LRT
+         already_lib_normalized=0, # This option adds the possibility to skip lib.normalization and used lib.factors in data. This is useful for example to normalize all conditions samples in a given species and then find DEGs between per condition (2 by 2)
+         colours_1=NA,colours_2=NA,colours_3=NA,colours_4=NA,colours_n=NA,
+         shapes_1=NA,shapes_2=NA,shapes_3=NA,shapes_4=NA,shapes_n=NA,
+         saveRDSonly=1,
+         testmode=0,
+         withnames=0,
+         last
+  ) {
+  
+  # Plot first the number of reads per sample to detect badly sequenced ones
+  d<-ggplot(data=data.frame(x=colnames(data$counts),y=colSums(data$counts)),aes(x=x,y=y,group=1))+
+          geom_point()+geom_line()+
+          ggtitle(paste0("Raw reads ",name)) +
+          ylab("Raw reads") + xlab("") + 
+          theme(axis.text.x = element_text(angle = 90, hjust = 1 , vjust=0.5))
+   if (print_onscreen==1 | is.na(name)){d}
+   if (!is.na(name)){
+      ggsave(filename=paste0(folder,"raw_reads_plot_",name,".jpg"), plot=d)
+    }
+  
+  # Filter out lowly expressed genes
+  sample <- data
+  if (already_lib_normalized==0){
+    if (filter=="exp"){ # Filtering suggested in edgeR manual
+      keep <- filterByExpr(sample)
+    } else if (filter=="cpm" | filter=="CPM"){ # Filtering used in edgeR paper
+      keep <- rowSums(cpm(sample)>=filtermin) >= filterminlib
+    } else if (filter=="raw" | filter=="RAW"){ # Filtering used in DESeq2 paper
+      keep <- rowSums(sample$counts) >= filtermin
+    } else if (filter=="rpkm" | filter=="RPKM"){ # another_posibility
+      keep <- rowSums(rpkm(sample)>=filtermin) >= filterminlib
+    } else if (filter=="samplesreplicates"){ # Filter by samples/replicates as Marie Laure
+      nbSamples = length(colnames(sample))
+      nbReplicate = length(unique(sample$group4[rownames(sample$group4) %in% colnames(sample),]))
+      keep <- rowSums(cpm(sample) >= filtermin) >= nbSamples/nbReplicate 
+    } else if (filter=="allreplicates"){ # Filter as at least all replicates in a given sample have > filtermin
+      x<-colnames(sample)
+      y<-unique(sample$samples$group)
+      s = data.frame(gene = rownames(sample$counts))
+      for (i in y){
+        z<-rownames(sample$samples[sample$samples$group %in% i,])
+        if (length(z)>1){
+          t<-rowSums(cpm(sample)[,colnames(cpm(sample)) %in% z]>=filtermin) >= filterminlib # length(x)/length(y) Didn't use this option to enable the possibility of i.e. look for expression in 2 out of 3 replicates.
+        } else {
+          t<-cpm(sample)[,colnames(cpm(sample)) %in% z]>=filtermin # If we have no replicates we'll take whatever we have.
+        }
+        s<-cbind(s,as.data.frame(t))
+        names(s)[names(s) == 't'] <- paste0(i)
+      }
+      s<-s[,colnames(s) %in% y]
+      keep <- rowSums(s) >= 1
+    }
+    sample_filtered <- sample[keep, , keep.lib.sizes=FALSE]
+  
+  
+    #TMM-normalization : IN OUR CASE IS VERY IMPORTANT NO CALCNORMFACTORS FOR SEEDENCODE DATA ALL SUBGENOMES. This is because TMM normalizes such a way that minimize genes differences between samples BUT is highly sensible to outgroups -> i.e. A and B are 0 at D
+    #The TMM counts are: count / (library size * normalization factor) # https://www.biostars.org/p/84087/
+    sample_filtered_TMM<-calcNormFactors(sample_filtered,method=normmethod)
+  } else {
+    sample_filtered <- sample
+    sample_filtered_TMM <- sample_filtered
+  }
+  
+  if(testmode!=1){
+    # Save some numbers about data Filtering and Normalization
+    filtnorm<-file(paste0(folder,name,"_Normalization_and_Filtering.txt"))
+    writeLines(c("################################################",
+                 "Filtering and Normalization",
+                 "################################################",
+                 "",
+                 "#### Description of Raw counts table ####",
+                 paste0("Number of samples: ", ncol(data$counts)),
+                 paste0("Number of genes: ", nrow(data$counts)),
+                 "",
+                 "#### Filtering ####",
+                 paste0("Filter method: ", filter),
+                 paste0("Number of features discarded by the filtering: ", nrow(data$counts)-nrow(sample_filtered_TMM$counts)),
+                 paste0("Number of analyzed genes after filtering: ", nrow(sample_filtered_TMM$counts)),
+                 "",
+                 "#### Samples ####",
+                 "Samples names and normalization factor: ",
+                 paste(rownames(sample_filtered_TMM$samples),sample_filtered_TMM$samples$norm.factors),
+                 "#### Normalization ####",
+                 "Normalization factors: ",
+                 paste0(sample_filtered_TMM$samples$norm.factors),
+                 ""), filtnorm)
+    close(filtnorm)
+  
+    # Save filtered out genes
+    filtnorm<-file(paste0(folder,name,"_Filtered_out_genes.txt"))
+    writeLines(c(paste0(rownames(data[!rownames(data$counts) %in% rownames(sample_filtered_TMM$counts),]$counts))), filtnorm)
+    close(filtnorm)
+  }
+
+  
+  # Calculate normalized values
+  sample_filtered_TMM_cpm<-cpm(sample_filtered_TMM,log=TRUE)
+  sample_highexpressed_filtered_TMM_cpm<-cpm(sample_filtered_TMM[order(rowMeans(cpm(sample_filtered_TMM)), decreasing=TRUE)[1:highly_expressed],])
+  
+  sample_filtered_TMM_tpm<-tpm.DGEList(sample_filtered_TMM,log=TRUE)
+  sample_highexpressed_filtered_TMM_tpm<-tpm(sample_filtered_TMM[order(rowMeans(tpm(sample_filtered_TMM)), decreasing=TRUE)[1:highly_expressed],])
+
+  sample_filtered_TMM_rpkm<-rpkm(sample_filtered_TMM,log=TRUE)
+  sample_highexpressed_filtered_TMM_rpkm<-rpkm(sample_filtered_TMM[order(rowMeans(rpkm(sample_filtered_TMM)), decreasing=TRUE)[1:highly_expressed],])
+
+
+  
+  # What data should we now use for plotting
+  if (use=="cpm" | use=="CPM"){
+    sample_filtered_TMM_use<-sample_filtered_TMM_cpm
+    sample_highexpressed_filtered_TMM_use<-sample_highexpressed_filtered_TMM_cpm
+  }  else if (use=="tpm" | use=="TPM"){
+    sample_filtered_TMM_use<-sample_filtered_TMM_tpm
+    sample_highexpressed_filtered_TMM_use<-sample_highexpressed_filtered_TMM_tpm
+  }  else if (use=="rpkm" | use=="RPKM"){
+    sample_filtered_TMM_use<-sample_filtered_TMM_rpkm
+    sample_highexpressed_filtered_TMM_use<-sample_highexpressed_filtered_TMM_rpkm
+  }
+  
+  # Select data for the n most highly expressed genes
+  sample_highexpressed_filtered_TMM<-sample_highexpressed_filtered_TMM_use
+
+  if (1!=DEGonly){
+  
+    # Expression barplot
+    if (length(sample$genes$Chromosome)<=100){
+      dag_expressed_genes_plot(sample,name=name,folder=folder)
+    }
+    
+    # Density plot of raw read counts (log10)
+    if (print_onscreen==1 | is.na(name)){
+      dag_densityplot_pergene(sample,logbase=10,method="Raw",name=name,folder=folder)
+      par(cex.axis=0.5)
+      boxplot(cpm(sample_filtered_TMM,log = TRUE),las=2)
+      par()
+      title(name)
+    }
+    if (!is.na(name)){
+      jpeg(paste0(folder,"density_plot_cpm_TMM_read_",name,".jpg"), width = 960, height = 960, pointsize = 18);
+      par(cex.axis=0.5)
+      boxplot(cpm(sample_filtered_TMM,log = TRUE),las=2)
+      par()
+      title(name)
+      dev.off()
+    }
+  
+  
+    # Heatmap of matrix of euclidean distances from the mapped read counts for the most highly expressed genes
+    # Main difference between heatmap and heatmap.2 is the rows reorder in the later. I can get that also in heatmap with option 'scale="none"'
+    # (Heatmap with fixed heatmap limitations)
+    if (break1==0 & break2==0){
+      break1=quantile(sample_highexpressed_filtered_TMM_use,probs = c(0.1, 0.90))[1]
+      break2=quantile(sample_highexpressed_filtered_TMM_use,probs = c(0.1, 0.90))[2]
+    }
+    dag_heatmap2(sample_highexpressed_filtered_TMM_use,break1=break1,break2=break2,tracecol = tracecol,hclust_method = hclust_method,name=name,folder=folder)
+  
+    # Heatmap of the sample-to-sample distances
+    dag_heatmap_sample_to_sample(sample_highexpressed_filtered_TMM_use,tracecol = tracecol,hclust_method = hclust_method,name=name,folder=folder)
+    
+
+    # PCA : Classical (base 'stats' package)
+    if (plot_PCA_highly==TRUE){
+      t<-dag_PCA(data=sample_highexpressed_filtered_TMM_use,name=paste0(name,"_Highly_expressed"),folder=folderPCA)
+      if (is.null(groupingby)){
+        for (case in c("group_1","group_2","group_3","group_4","none")){
+          if (case %in% c("group_1")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames)}
+          if (case %in% c("group_2")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames)}
+          if (case %in% c("group_3")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames)}
+          if (case %in% c("group_4")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames)}
+          if (case %in% c("none")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames)}
+        }
+      } else {
+         for (case in c(groupingby)){
+          if (case %in% c("group_1")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames)}
+          if (case %in% c("group_2")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames)}
+          if (case %in% c("group_3")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames)}
+          if (case %in% c("group_4")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames)}
+          if (case %in% c("none")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_Highly_expressed"),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames)}
+        }
+      }
+    }
+    
+    t<-dag_PCA(sample_filtered_TMM_use,name=paste0(name,"_All"),folder=folderPCA)
+    if (is.null(groupingby)){
+      for (case in c("group_1","group_2","group_3","group_4","none")){
+        if (case %in% c("group_1")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames)}
+        if (case %in% c("group_2")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames)}
+        if (case %in% c("group_3")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames)}
+        if (case %in% c("group_4")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames)}
+        if (case %in% c("none")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames)}
+      }
+    } else {
+       for (case in c(groupingby)){
+        if (case %in% c("group_1")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames)}
+        if (case %in% c("group_2")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames)}
+        if (case %in% c("group_3")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames)}
+        if (case %in% c("group_4")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames)}
+        if (case %in% c("none")){dag_nice_PCA_MDS(t,case,name=paste0(name,"_All"),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames)}
+      }
+    }
+    
+    
+    if (ncol(t$points)>=2){
+      if (per_chromosome==1){
+        for (k in unique(data$genes$Chromosome)){
+          if (plot_PCA_highly==TRUE){
+            t<-dag_PCA(sample_highexpressed_filtered_TMM_use[rownames(sample_highexpressed_filtered_TMM_use) %in% data$genes[data$genes$Chromosome %like% k,"Geneid"],],name=paste0(name,"_Highly_expressed_",k),folder=PCA)
+             if (is.null(groupingby)){
+                assign(paste0("h1_",k),dag_nice_PCA_MDS(t,"group_1",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames))
+                assign(paste0("h2_",k),dag_nice_PCA_MDS(t,"group_2",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames))
+                assign(paste0("h3_",k),dag_nice_PCA_MDS(t,"group_3",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_2,withnames=withnames))
+                assign(paste0("h4_",k),dag_nice_PCA_MDS(t,"group_4",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames))
+                assign(paste0("hn_",k),dag_nice_PCA_MDS(t,"none",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames))
+             } else {
+                if (c("group_1") %in% groupingby){assign(paste0("a1_",k),dag_nice_PCA_MDS(t,"group_1",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames))
+                } else if (c("group_2") %in% groupingby){assign(paste0("a2_",k),dag_nice_PCA_MDS(t,"group_2",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames))
+                } else if (c("group_3") %in% groupingby){assign(paste0("a3_",k),dag_nice_PCA_MDS(t,"group_3",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames))
+                } else if (c("group_4") %in% groupingby){assign(paste0("a4_",k),dag_nice_PCA_MDS(t,"group_4",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames))
+                } else if (c("none") %in% groupingby){assign(paste0("an_",k),dag_nice_PCA_MDS(t,"none",name=paste0(name,"_Highly_expressed_",k),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames))
+                }
+             }
+          }
+          t<-dag_PCA(sample_filtered_TMM_use[rownames(sample_filtered_TMM_use) %in% data$genes[data$genes$Chromosome %like% k,"Geneid"],],name=paste0(name,"_All_",k),folder=paste0(folder,"PCA/"))
+          if (is.null(groupingby)){
+            assign(paste0("a1_",k),dag_nice_PCA_MDS(t,"group_1",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames))
+            assign(paste0("a2_",k),dag_nice_PCA_MDS(t,"group_2",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames))
+            assign(paste0("a3_",k),dag_nice_PCA_MDS(t,"group_3",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames))
+            assign(paste0("a4_",k),dag_nice_PCA_MDS(t,"group_4",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames))
+            assign(paste0("an_",k),dag_nice_PCA_MDS(t,"none",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames))
+          } else {
+            if (c("group_1") %in% groupingby){assign(paste0("a1_",k),dag_nice_PCA_MDS(t,"group_1",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_1,shapes=shapes_1,withnames=withnames))
+            } else if (c("group_2") %in% groupingby){assign(paste0("a2_",k),dag_nice_PCA_MDS(t,"group_2",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_2,shapes=shapes_2,withnames=withnames))
+            } else if (c("group_3") %in% groupingby){assign(paste0("a3_",k),dag_nice_PCA_MDS(t,"group_3",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_3,shapes=shapes_3,withnames=withnames))
+            } else if (c("group_4") %in% groupingby){assign(paste0("a4_",k),dag_nice_PCA_MDS(t,"group_4",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_4,shapes=shapes_4,withnames=withnames))
+            } else if (c("none") %in% groupingby){assign(paste0("an_",k),dag_nice_PCA_MDS(t,"none",name=paste0(name,"_All_",k),"Dimension",folder=folderPCA,colours=colours_n,shapes=shapes_n,withnames=withnames))
+            }
+          }
+        }
+        
+        if (plot_PCA_highly==TRUE){kc=c("h","a");}else {kc=c("a");}
+        for (kk in kc){
+          for (kkk in c(1:4,"n")){
+            for (kpca in c(1:2)){
+              k=paste0(kk,kkk)
+              if (kpca==1){kpca1="PC1";kpca2="PC2"}else if (kpca==2){kpca1="PC3";kpca2="PC4"}
+              
+              if(kk=="h"){kn=paste0(folderPCA,name,"_Highly_expressed_all_chromosomes_group_",kkk,"_",kpca1,"_",kpca2,".jpg");
+                          knn=paste0(name,"_Highly_expressed_group_",kkk,"_",kpca1,"_",kpca2)
+              } else if(kk=="a"){kn=paste0(folderPCA,name,"_All_all_chromosomes_group_",kkk,"_",kpca1,"_",kpca2,".jpg");
+                          knn=paste0(name,"_All_group_",kkk,"_",kpca1,"_",kpca2)}
+              jpeg(kn);
+              grid.arrange(
+                get(paste0(k,"_chr1A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr1B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr1D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr2A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr2B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr2D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr3A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr3B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr3D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr4A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr4B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr4D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr5A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr5B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr5D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr6A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr6B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr6D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr7A"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr7B"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                get(paste0(k,"_chr7D"))[[kpca]] + theme(legend.position = "none",axis.text = element_blank(),axis.title.x =element_blank(),axis.title.y =element_blank())+ggtitle(label = NULL),
+                nrow=7,ncol=3,top = textGrob(knn,gp=gpar(fontsize=12,font=3)))
+              dev.off()
+            }
+          }
+        }
+      }
+    }
+    
+    # Pairs heatmap
+    if (plot_pairs_heatmap=="yes"){
+      t<-cor(sample_filtered_TMM_use, method = c("pearson")) #cor(t, method = c("pearson", "kendall", "spearman"))
+    write.table(t,file=paste0(folder,"pairs_heatmap_",name,".txt"))
+      ph<-ggpairs(as.data.frame(sample_filtered_TMM_use), lower=list(continuous=dag_ggpairs_own_points)) + theme_bw()
+      n<-paste0(folder,"pairs_heatmap_",name,".jpg")
+      if (ncol(sample_filtered_TMM_use)<=10){
+        ggsave(filename=n, plot=ph, width = 10, height = 10)
+      } else if (ncol(sample_filtered_TMM_use)<=20){
+        ggsave(filename=n, plot=ph, width = 20, height = 20)
+      } else if (ncol(sample_filtered_TMM_use)<=30){
+        ggsave(filename=n, plot=ph, width = 30, height = 30)
+      } else {
+        ggsave(filename=n, plot=ph, width = 40, height = 40)
+      }
+    }  
+    
+    # Correlation (Pairs heatmap means)
+    sample_filtered_TMM_use_mean <-as.data.frame(sample_filtered_TMM_use)
+    for (i in unique(gsub("_[0-9]$","",colnames(sample_filtered_TMM_use)))){
+      if (is.null(ncol(sample_filtered_TMM_use[,colnames(sample_filtered_TMM_use) %like% i]))){
+        sample_filtered_TMM_use_mean[,i]<-sample_filtered_TMM_use[,colnames(sample_filtered_TMM_use) %like% i]
+      } else {
+        sample_filtered_TMM_use_mean[,i]<-rowMeans(sample_filtered_TMM_use[,colnames(sample_filtered_TMM_use) %like% i])
+      }
+    }
+    sample_filtered_TMM_use_mean <- sample_filtered_TMM_use_mean[,!colnames(sample_filtered_TMM_use_mean) %like% "_[0-9]$"]
+    t<-cor(sample_filtered_TMM_use_mean, method = c("pearson")) #cor(t, method = c("pearson", "kendall", "spearman"))
+    write.table(t,file=paste0(folder,"pairs_heatmap_",name,"_mean.txt"))
+    cor<-ggpairs(as.data.frame(sample_filtered_TMM_use_mean), lower=list(continuous=dag_ggpairs_own_points)) + theme_bw()
+    n<-paste0(folder,"pairs_heatmap_",name,"_mean.jpg")
+    ggsave(filename=n, plot=cor, width = 10, height = 10)
+    
+  
+    # Expression levels boxplots
+    i<-as.data.frame(cpm(sample_filtered_TMM,log=FALSE),keep.rownames = TRUE)
+    dag_stackplot(i,name=name,folder)
+  
+    # Ternary plots (Must copy paste them here to create all combinations as I did with pairs heatmaps), TO DO.
+  }  
+  
+
+  if (runedgeR==1){
+    folderDEG<-paste0(folderedgeR,name,"/")
+    dir.create(paste0(folderDEG), showWarnings = FALSE)
+    dir.create(paste0(folderDEG,"data"), showWarnings = FALSE)
+
+    # Dif. Exp. Analysis edgeR 
+    ##########################
+    if(testmode!=1){
+      if (!is.na(name)){
+        jpeg(paste0(folderDEG,"edgeR_MD_plot_expression_sample1_versus_average_other_",name,".jpg"));
+      
+        n<-length(colnames(sample_filtered_TMM))
+        if (n>20){
+          par(mfrow=c(6,6))
+        } else if (n==20){
+          par(mfrow=c(5,4))
+        } else if (n==16){
+          par(mfrow=c(4,4))
+        } else if (n==8){
+          par(mfrow=c(4,2))
+        } else if (n==4){
+          par(mfrow=c(2,2))
+        } else if (n==2){
+          par(mfrow=c(2,1))
+        } else {
+          par(mfrow=c(4,4))
+        }
+      
+        par(mar = rep(2, 4))
+        for (i in 1:n){plotMD(sample_filtered_TMM, column=i, xlab="", ylab="") + abline(h=0, col="red", lty=2, lwd=2)}
+        par(mfrow=c(1,1))
+        dev.off()
+      }
+    
+      if (print_onscreen==1 | is.na(name)){
+        par(mar = rep(2, 4))
+        for (i in 1:n){plotMD(sample_filtered_TMM, column=i, xlab="", ylab="") + abline(h=0, col="red", lty=2, lwd=2)}
+        par(mfrow=c(1,1))
+      }
+    }
+  
+    y<-sample_filtered_TMM
+  
+    # # The design matrix
+    # group <- y$samples$group
+    # design <- model.matrix(~0 + group)
+    # colnames(design)<-levels(group)
+    
+    # The design matrix and contrasts has been provided already
+
+    # Estimate common dispersion, trended dispersion and tagwise dispersions in one run (recommended)
+    y<- estimateDisp(y,design,robust=TRUE)
+    y$common.dispersion
+    # BCV: Biological Coefficient of Variation https://academic.oup.com/nar/article/40/10/4288/2411520
+    if(testmode!=1){
+      if (print_onscreen==1 | is.na(name)){plotBCV(y)}
+      if (!is.na(name)){
+        jpeg(paste0(folderDEG,"edgeR_BCV_",name,".jpg"));
+        plotBCV(y)
+        n<-paste0("BCV_",name)
+        title(name)
+        dev.off()
+      }
+    }
+    # Testing QL dispersions
+    # glmQLFit : Genewise Negative Binomial Generalized Linear Models with Quasi-likelihood Tests
+    # Description : Fit a quasi-likelihood negative binomial generalized log-linear model to count data. Conduct genewise statistical tests for a given coefficient or contrast.
+    fit1 <- glmQLFit(y, design, robust=TRUE)
+    head(fit1$coefficients)
+    if(testmode!=1){
+      if (print_onscreen==1 | is.na(name)){
+        plotQLDisp(fit1,xlab="Average Log2 CPM", ylab="Quarter-Root Mean Deviance")
+        title(name)
+      }
+      if (!is.na(name)){
+        jpeg(paste0(folderDEG,"edgeR_QLDisp_plot_",name,".jpg"));
+        plotQLDisp(fit1,xlab="Average Log2 CPM", ylab="Quarter-Root Mean Deviance")
+        title(name)
+        dev.off()
+      }
+    }
+  
+    # Test also likelihood ratio test
+    fit2 <- glmFit(y, design, robust=TRUE)
+    head(fit2$coefficients)
+
+    if (model_method=="both" | model_method=="Both"){model_method<-c("QLF","LRT")}
+    for (j in model_method){
+      dir.create(paste0(folderDEG,j), showWarnings = FALSE)
+      print(paste0(j))
+      for (i in 1:nrow(contrasts)){
+        print(paste0(i," ",contrasts[i,]))
+        if (j == "QLF"){
+          fit<-fit1
+          lf <- glmQLFTest(fit,contrast=as.numeric(contrasts[i,]))
+        }
+        if (j == "LRT"){
+          fit<-fit2
+          lf <- glmLRT(fit,contrast=as.numeric(contrasts[i,]))
+        }
+        summary(decideTests(lf,p.value=padjusted))
+        if (print_onscreen==1 | is.na(name)){
+          plotMD(lf)
+          abline(h=c(-1:1), col="violet")
+        }
+
+        x<-rownames(contrasts[i,])
+      
+        if(testmode!=1){
+          jpeg(paste0(folderDEG,j,"/edgeR_",j,"_MD_",name,"_",x,".jpg"));
+          plotMD(lf)
+          abline(h=c(-1:1), col="violet")
+          dev.off()
+        }
+        
+        all<-topTags(lf,150000,p.value=1)
+        fil<-topTags(lf,150000,p.value=padjusted)
+
+        if(testmode!=1 & nrow(all)!=0){
+          dag_volcano(data=all,FDR_val=0.01,logFC_val=1,genes=NA,name=name,filename=paste0(folderDEG,j,"/volcano-edgeR_",j,"_MD_",name,"_",x,".jpg"))
+        }
+                
+        if (length(fil)!=0){
+          up<-fil$table[fil$table$logFC>0,]
+          down<-fil$table[fil$table$logFC<0,]
+      
+          # Create heatmap to test if selected genes distinguish well each condition (http://pedagogix-tagc.univ-mrs.fr/courses/ASG1/practicals/rnaseq_diff/rnaseq_diff.html)
+          ## We select gene names based on FDR
+          gene.kept <- fil$table$Geneid
+        
+          ## We retrieve the normalized counts for gene of interest
+          count.table<-as.data.frame(sample_filtered_TMM_use)
+          
+          # These lines are used to recover only the columns used. I need to pass this info though
+          if (!is.null(used) & !is.null(fgroup)){
+            if (nrow(used[rownames(used) == rownames(contrasts[i,]),])==1){
+              t<-colnames(used)[used[rownames(used) == rownames(contrasts[i,]),]==1]
+              count.table<-count.table[,colnames(count.table) %in% t]
+            }
+          }
+            
+          count.table.kept<-count.table[rownames(count.table) %in% gene.kept,]
+          count.table.kept<-as.matrix(count.table.kept)
+          break1=quantile(count.table.kept,probs = c(0.1, 0.90))[1]
+          break2=quantile(count.table.kept,probs = c(0.1, 0.90))[2]
+          #}
+          if(testmode!=1){
+            if (nrow(count.table.kept)<=10000 & nrow(count.table.kept)>=2){
+              dag_heatmap2(count.table.kept,break1=break1,break2=break2,tracecol = tracecol,hclust_method = hclust_method,name=paste0("edgeR_",j,"_",name,"_",x),folder=paste0(folderDEG,"/",j,"/"))
+            }
+          }
+          
+          if(testmode!=1){
+            if (nrow(count.table.kept)>=1){
+            toprint<-count.table.kept
+            if (nrow(toprint)>topclust){toprint<-count.table.kept[1:topclust,]}
+            toprint<-as.matrix(toprint)
+            break1=quantile(toprint,probs = c(0.1, 0.90))[1]
+            break2=quantile(toprint,probs = c(0.1, 0.90))[2]
+            if (nrow(toprint)<=10000 & nrow(toprint)>=2){
+              dag_heatmap2(toprint,break1=break1,break2=break2,tracecol = tracecol,hclust_method = hclust_method,name=paste0("edgeR_",j,"_",name,"_",x,"_top",topclust,"_clustering.pdf"),folder=paste0(folderDEG,"/",j,"/"))
+            }
+  
+            # Draft function to add a graph similar to what ML does
+            toprint<-count.table.kept
+            if (nrow(toprint)>toppro){toprint<-count.table.kept[1:toppro,]}
+            pdf(paste0(folderDEG,"/",j,"/edgeR_",j,"_",name,"_",x,"_top",toppro,"_profile.pdf"),onefile = TRUE)
+            for (k in 1:nrow(toprint)){
+              t<-fgroup[fgroup$sample %in% colnames(count.table.kept),]
+              tt<-data.frame(
+                sample = colnames(count.table.kept),
+                counts = count.table.kept[k,]
+              )
+              ttt<-merge(t,tt,by="sample")
+              
+              if (length(unique(ttt$grp2))==1){
+                ttt$grp<-ttt$grp1;ttt$grp1<-ttt$grp2;ttt$grp2<-ttt$grp
+  
+                pr<-ggplot(ttt, aes(x=as.factor(grp2), y=counts)) + geom_line(aes(colour=grp1)) + 
+                   stat_summary(fun.y=mean, geom="line", aes(group=grp1, colour=grp1))  + 
+                   stat_summary(fun.y=mean, geom="point", aes(group=grp1, colour=grp1)) + 
+                   theme(axis.title.x = element_blank(), legend.title = element_blank()) + ylab(use) + ggtitle(rownames(toprint[k,]))
+                print(pr)
+              } else {
+                pr<-ggplot(ttt, aes(x=as.factor(grp1), y=counts)) + geom_line(aes(colour=grp1)) + 
+                   stat_summary(fun.y=mean, geom="point", aes(group=grp1, colour=grp1)) + 
+                   theme(axis.title.x = element_blank(), legend.title = element_blank()) + ylab(use) + ggtitle(rownames(toprint[k,]))
+                print(pr)
+              }
+              
+            }
+            dev.off()
+            
+          }
+          }
+          if(testmode!=1){          
+            # Save gene lists
+            saveRDS(up,file=paste0(folderDEG,"data/edgeR_",j,"_up_",name,"_",x,".Rds"))
+            saveRDS(down,file=paste0(folderDEG,"data/edgeR_",j,"_down_",name,"_",x,".Rds"))
+          }
+        }
+        
+        if(testmode!=1){
+          # Plot the FDR values 
+          dag_plot_FDR(data=all$table,folder=paste0(folderDEG,j,"/"),name=paste0("edgeR_",j,"_all_",name,"_",x))
+        }
+        
+        saveRDS(all,file=paste0(folderDEG,"data/edgeR_",j,"_all_",name,"_",x,".Rds"))
+        
+        # Save bins data too
+        breaks<-c(0:200)
+        breaks<-breaks/(max(breaks))
+        bins<-cut(all$table$PValue,breaks,include.lowest = T,right=FALSE)
+        ratio<-table(bins)[200]/table(bins)[199]
+        names(ratio)<-name
+        write.table(ratio,file=paste0(folderDEG,j,"/ratio_edgeR_",j,"_all_",name,"_",x,".txt"),col.names=FALSE)
+        write.table(as.data.table(table(bins)),file=paste0(folderDEG,j,"/bins_edgeR_",j,"_all_",name,"_",x,".txt"),col.names=FALSE)
+        
+        if (saveRDSonly==0){
+          write.table(all,file=paste0(folderDEG,"data/edgeR_",j,"_all_",name,"_",x,".txt"))
+        }
+      }
+    }
+  }
+  
+  
+  # Save filtered and calculated data 
+  #saveRDS(sample_filtered,file=paste0(folder,"data/",name,"_sample_filtered.Rds"))
+  saveRDS(sample_filtered_TMM,file=paste0(folder,"data/",name,"_sample_filtered_TMM.Rds"))
+  #saveRDS(sample_filtered_TMM_cpm,file=paste0(folder,"data/",name,"_sample_filtered_TMM_cpm.Rds"))
+  #saveRDS(sample_filtered_TMM_rpkm,file=paste0(folder,"data/",name,"_sample_filtered_TMM_rpkm.Rds"))
+  #saveRDS(sample_filtered_TMM_tpm,file=paste0(folder,"data/",name,"_sample_filtered_TMM_tpm.Rds"))
+  saveRDS(sample_highexpressed_filtered_TMM,file=paste0(folder,"data/",name,"_sample_highexpressed_filtered_TMM.Rds"))
+  #saveRDS(sample_highexpressed_filtered_TMM_cpm,file=paste0(folder,"data/",name,"_sample_highexpressed_filtered_TMM_cpm.Rds"))
+  #saveRDS(sample_highexpressed_filtered_TMM_rpkm,file=paste0(folder,"data/",name,"_sample_highexpressed_filtered_TMM_rpkm.Rds"))
+  #saveRDS(sample_highexpressed_filtered_TMM_tpm,file=paste0(folder,"data/",name,"_sample_highexpressed_filtered_TMM_tpm.Rds"))
+  
+  return(list(sample=sample,
+              sample_filtered=sample_filtered,
+              sample_filtered_TMM=sample_filtered_TMM,
+              sample_filtered_TMM_use=sample_filtered_TMM_use,
+              sample_highexpressed_filtered_TMM=sample_highexpressed_filtered_TMM,
+              sample_highexpressed_filtered_TMM_use=sample_highexpressed_filtered_TMM_use
+  ))
+}
+
+##########################
+# dag_design_and_contrasts
+##########################
+# Fixed 2022/02/07 to work with contrast2, contrast3 or contrast4 (actually this was incorrect: contrast1 == 0 & contrast2 == 0  & contrast3 == 1 & contrast3 == 0 )
+dag_design_and_contrasts<-function(data,folder="",name="",incompatible="",basic=1,simple=1,complex=0,
+         contrast1=0,
+         contrast2=0,
+         contrast3=0,
+         contrast4=0){ # I'll assume that Group1=Species; Group2=Stade; Group3=Condition; Group4=Replicate and I'll only accept 1 or 2 vs 3 or 4
+  
+    y<-data
+    y$group1$sample<-rownames(y$group1)
+    y$group2$sample<-rownames(y$group2)
+    y$group3$sample<-rownames(y$group3)
+    y$group4$sample<-rownames(y$group4)
+
+    group1 <- droplevels(y$group1[rownames(y$group1) %in% rownames(y$samples),])
+    group2 <- droplevels(y$group2[rownames(y$group2) %in% rownames(y$samples),])
+    group3 <- droplevels(y$group3[rownames(y$group3) %in% rownames(y$samples),])
+    group4 <- droplevels(y$group4[rownames(y$group4) %in% rownames(y$samples),])
+  
+    # Reorder to have the right samples order
+    fgroup1<-group1[c(rownames(y$samples)),]
+    fgroup2<-group2[c(rownames(y$samples)),]
+    fgroup3<-group3[c(rownames(y$samples)),]
+    fgroup4<-group4[c(rownames(y$samples)),]
+    
+    group1<-group1[c(rownames(y$samples)),"group"]
+    group2<-group2[c(rownames(y$samples)),"group"]
+    group3<-group3[c(rownames(y$samples)),"group"]
+    group4<-group4[c(rownames(y$samples)),"group"]
+    
+    
+    if (contrast1 == 1 & contrast2 == 0 & contrast3 == 0 & contrast4 == 0){design <- model.matrix(~ group1)
+    } else if (contrast1 == 0 & contrast2 == 1 & contrast3 == 0 & contrast4 == 0){design <- model.matrix(~ group2)
+    } else if (contrast1 == 0 & contrast2 == 0 & contrast3 == 1 & contrast4 == 0){design <- model.matrix(~ group3)
+    } else if (contrast1 == 0 & contrast2 == 0 & contrast3 == 0 & contrast4 == 1){design <- model.matrix(~ group4)
+    } else if (contrast1 == 1 & contrast2 == 1 & contrast3 == 0 & contrast4 == 0){design <- model.matrix(~ group1 * group2) # ML uses + group4 but it is not necessary because she doesn't use it anymore on contrast matrix
+    } else if (contrast1 == 1 & contrast2 == 0 & contrast3 == 1 & contrast4 == 0){design <- model.matrix(~ group1 * group3)
+    } else if (contrast1 == 1 & contrast2 == 0 & contrast3 == 0 & contrast4 == 1){design <- model.matrix(~ group1 * group4)
+    } else if (contrast1 == 0 & contrast2 == 1 & contrast3 == 1 & contrast4 == 0){design <- model.matrix(~ group2 * group3)
+    } else if (contrast1 == 0 & contrast2 == 1 & contrast3 == 0 & contrast4 == 1){design <- model.matrix(~ group2 * group4)
+    } else {print("Error. Wrong model design selected.");stop()}
+    colnames(design)<-gsub("group[0-9]","",colnames(design))
+    
+    
+    # Create matrix with all coef/contrasts I might be interested on
+    fgroup=merge(merge(fgroup1,fgroup2,by="sample"),merge(fgroup3,fgroup4,by="sample"), by="sample")
+    colnames(fgroup)<-c("sample","group1","group2","group3","group4")
+    
+
+    if ((contrast1==1 && contrast2==0  && contrast3==0  && contrast4==0) |
+        (contrast1==0 && contrast2==1  && contrast3==0  && contrast4==0) | 
+        (contrast1==0 && contrast2==0  && contrast3==1  && contrast4==0) | 
+        (contrast1==0 && contrast2==0  && contrast3==0  && contrast4==1)){
+        
+        p1<-0;p2<-0;p3<-0;p4<-0;
+        if (contrast1==1 && contrast2==0  && contrast3==0  && contrast4==0){grp1<-group1;p1<-1;fgroup<-fgroup[,c("sample","group1")]
+        } else if (contrast1==0 && contrast2==1  && contrast3==0  && contrast4==0){grp1<-group2;p2<-1;fgroup<-fgroup[,c("sample","group2")]
+        } else if (contrast1==0 && contrast2==0  && contrast3==1  && contrast4==0){grp1<-group3;p3<-1;fgroup<-fgroup[,c("sample","group3")]
+        } else if (contrast1==0 && contrast2==0  && contrast3==0  && contrast4==1){grp1<-group4;p4<-1;fgroup<-fgroup[,c("sample","group4")]}
+        
+        colnames(fgroup)<-c("sample","grp1")
+        
+        n1=0;
+        if (length(unique(grp1))>1){n1<-data.frame(t(data.frame(combn(unique(grp1), 2, simplify = FALSE))),row.names = NULL)}
+        
+        coefcon <- data.frame(matrix(ncol = ncol(design), nrow = 0))
+        colnames(coefcon) <- colnames(design)
+        
+        used <- data.frame(matrix(ncol = length(colnames(y$counts)), nrow = 0))
+        colnames(used) <- colnames(y$counts)
+        intersect=as.character(unique(grp1)[1])
+
+        if (basic==1){
+          # grp1
+          for (x1 in 1:nrow(n1)){ 
+            n<-paste0("(",n1[x1,1],"_",n1[x1,2],")")
+            coefcon[n,]<-0
+            coefcon[n,paste0(n1[x1,1])]<-1
+            coefcon[n,paste0(n1[x1,2])]<--1
+            used[n,]=0
+       
+            if (p1==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_.*")]<-1
+            } else if (p2==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_.*")]<-1
+            } else if (p3==1){
+              used[n,colnames(used) %like% paste0(".*_.*_",n1[x1,1],"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_.*_",n1[x1,2],"_.*")]<-1
+            } else if (p4==1){
+              used[n,colnames(used) %like% paste0(".*_.*_.*_",n1[x1,1],"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_.*_.*_",n1[x1,2],"$")]<-1
+            }
+          }
+        }
+        
+        if (complex==1){
+          # Add complex cases All vs All EXCEPT incompatibles
+          # Effect grp1 : Single vs All
+          
+          for (x1 in unique(grp1)){
+            x11<-unique(grp1)[!unique(grp1) %in% x1]
+            for (x3 in incompatible){
+              x33<-x11[!x11 %in% incompatible[!incompatible %in% x3]]
+              if (length(x33)!=0){
+                # Effect Single vs All
+                n<-paste0("(",x1,")-(")
+                for (i in 1:length(x33)){
+                  n<-paste0(n,x33[i])
+                  if (i!=length(x33)){n<-paste0(n,"-")}
+                }
+                #n<-paste0(n,")/",length(x33))
+                n<-paste0(n,")")
+                used[n,]=0
+                coefcon[n,]<-0
+                coefcon[n,x1]<-1
+                
+                for (i in 1:length(x33)){
+                coefcon[n,as.character(x33[i])]<--1/length(x33)
+              
+                if (p1==1){
+                      used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_.*")]<-1 # Must be verified
+                      used[n,colnames(used) %like% paste0("^",x33[i],"_.*_.*_.*")]<-1 # Must be verified
+                } else if (p2==1){
+                      used[n,colnames(used) %like% paste0("_.*",x1,"_.*_.*")]<-1 # Must be verified
+                      used[n,colnames(used) %like% paste0("_.*",x33[i],"_.*_.*")]<-1 # Must be verified
+                } else if (p3==1){
+                      used[n,colnames(used) %like% paste0("_.*_.*",x1,"_.*")]<-1 # Must be verified
+                      used[n,colnames(used) %like% paste0("_.*_.*",x33[i],"_.*")]<-1 # Must be verified
+                } else if (p4==1){
+                      used[n,colnames(used) %like% paste0("_.*_.*_.*",x1,"$")]<-1 # Must be verified
+                      used[n,colnames(used) %like% paste0("_.*_.*_.*",x33[i],"$")]<-1 # Must be verified
+                }
+              }
+              }
+            }
+          }
+        }      
+        coefcon<-coefcon[,colnames(design)]
+    }
+    
+    else {
+      p1<-0;p2<-0;p3<-0;p4<-0;
+      if        (contrast1==1 && contrast2==1){grp1<-group1;grp2<-group2;p1<-1;p2<-1;fgroup<-fgroup[,c("sample","group1","group2")]
+      } else if (contrast1==1 && contrast3==1){grp1<-group1;grp2<-group3;p1<-1;p3<-1;fgroup<-fgroup[,c("sample","group1","group3")]
+      } else if (contrast1==1 && contrast4==1){grp1<-group1;grp2<-group4;p1<-1;p4<-1;fgroup<-fgroup[,c("sample","group1","group4")]
+      } else if (contrast2==1 && contrast3==1){grp1<-group2;grp2<-group3;p2<-1;p3<-1;fgroup<-fgroup[,c("sample","group2","group3")]
+      } else if (contrast2==1 && contrast4==1){grp1<-group2;grp2<-group4;p2<-1;p4<-1;fgroup<-fgroup[,c("sample","group2","group4")]
+      } else if (contrast3==1 && contrast4==1){grp1<-group3;grp2<-group4;p3<-1;p4<-1;fgroup<-fgroup[,c("sample","group3","group4")]
+      } 
+      colnames(fgroup)<-c("sample","grp1","grp2")
+      
+      n1=0;n2=0;
+      if (length(unique(grp1))>1){n1<-data.frame(t(data.frame(combn(unique(grp1), 2, simplify = FALSE))),row.names = NULL)}
+      if (length(unique(grp2))>1){n2<-data.frame(t(data.frame(combn(unique(grp2), 2, simplify = FALSE))),row.names = NULL)}
+      
+      coefcon <- data.frame(matrix(ncol = ncol(design), nrow = 0))
+      colnames(coefcon) <- colnames(design)
+      
+      used <- data.frame(matrix(ncol = length(colnames(y$counts)), nrow = 0))
+      colnames(used) <- colnames(y$counts)
+      intersect=as.character(unique(grp1)[1])
+      intersect_2=as.character(unique(grp2)[1])
+      
+      if (basic==1){
+        # grp1
+        for (x1 in 1:nrow(n1)){ 
+          n<-paste0("(",n1[x1,1],"_",n1[x1,2],")")
+          coefcon[n,]<-0
+          coefcon[n,paste0(n1[x1,1])]<-1
+          coefcon[n,paste0(n1[x1,2])]<--1
+          used[n,]=0
+          for (x2 in 1:nrow(n2)){
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,1])]<-1/length(unique(grp2))
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,2])]<-1/length(unique(grp2))
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,1])]<--1/length(unique(grp2))
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,2])]<--1/length(unique(grp2))
+          }
+          
+          if (p1==1 & p2==1){
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+          } else if (p1==1 & p3==1){
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+          } else if (p1==1 & p4==1){
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+            used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+          } else if (p2==1 & p3==1){
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,1]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,2]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,1]),"_.*")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,2]),"_.*")]<-1
+          } else if (p2==1 & p4==1){
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,1]),"$")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,2]),"$")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,1]),"$")]<-1
+            used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,2]),"$")]<-1
+          }
+        }
+        # grp2
+        for (x2 in 1:nrow(n2)){
+          n<-paste0("(",n2[x2,1],"_",n2[x2,2],")")
+          coefcon[n,]<-0
+          coefcon[n,paste0(n2[x2,1])]<-1
+          coefcon[n,paste0(n2[x2,2])]<--1
+          used[n,]=0
+          for (x1 in 1:nrow(n1)){
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,1])]<-1/length(unique(grp1))
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,2])]<--1/length(unique(grp1))
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,1])]<-1/length(unique(grp1))
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,2])]<--1/length(unique(grp1))
+            
+            if (p1==1 & p2==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+            }
+            else if (p1==1 & p3==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+            } else if (p1==1 & p4==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+            } else if (p2==1 & p3==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,2]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,2]),"_.*")]<-1
+            } else if (p2==1 & p4==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,2]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,2]),"$")]<-1
+            }
+          }
+        }
+        # grp1-2 
+        for (x1 in 1:nrow(n1)){
+          for (x2 in unique(grp2)){
+            n<-paste0("(",n1[x1,1],"_",x2,"-",n1[x1,2],"_",x2,")")
+            coefcon[n,]<-0
+            coefcon[n,paste0(n1[x1,1])]<-1
+            coefcon[n,paste0(n1[x1,2])]<--1
+            coefcon[n,paste0(n1[x1,1],":",x2)]<-1
+            coefcon[n,paste0(n1[x1,2],":",x2)]<--1
+    
+            used[n,]=0
+            if (p1==1 & p2==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(x2),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(x2),"_.*_.*")]<-1
+            } else if (p1==1 & p3==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(x2),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(x2),"_.*")]<-1
+            } else if (p1==1 & p4==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(x2),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(x2),"$")]<-1
+            } else if (p2==1 & p3==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(x2),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(x2),"_.*")]<-1
+            } else if (p2==1 & p4==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(x2),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(x2),"$")]<-1
+            }
+          }
+        }
+        # grp2 effect only 
+        for (x1 in unique(grp1)){
+          for (x2 in 1:nrow(n2)){
+            n<-paste0("(",x1,"_",n2[x2,1],"-",x1,"_",n2[x2,2],")")
+            coefcon[n,]<-0
+            coefcon[n,paste0(n2[x2,1])]<-1
+            coefcon[n,paste0(n2[x2,2])]<--1
+            coefcon[n,paste0(x1,":",n2[x2,1])]<-1
+            coefcon[n,paste0(x1,":",n2[x2,2])]<--1
+          }
+          used[n,]=0
+          
+          if (p1==1 & p2==1){
+              used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_.*")]<-1
+          } else if (p1==1 & p3==1){
+              used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_.*")]<-1
+          } else if (p1==1 & p4==1){
+              used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_.*")]<-1
+          } else if (p2==1 & p3==1){
+              used[n,colnames(used) %like% paste0(".*_",x1,"_.*_.*")]<-1
+          } else if (p2==1 & p4==1){
+              used[n,colnames(used) %like% paste0(".*_",x1,"_.*_.*")]<-1
+          }
+        }
+        coefcon<-coefcon[,colnames(design)]
+      }
+      if (simple==1){
+        # Interaction effect only
+        for (x1 in 1:nrow(n1)){ 
+          for (x2 in 1:nrow(n2)){
+            n<-paste0("(",n1[x1,1],"_",n2[x2,1],"-",n1[x1,1],"_",n2[x2,2],")-(",n1[x1,2],"_",n2[x2,1],"-",n1[x1,2],"_",n2[x2,2],")")
+            coefcon[n,]<-0
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,1])]<--1
+            coefcon[n,paste0(n1[x1,1],":",n2[x2,2])]<-1
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,1])]<-1
+            coefcon[n,paste0(n1[x1,2],":",n2[x2,2])]<--1
+            
+            used[n,]=0
+            if (p1==1 & p2==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+            } else if (p1==1 & p3==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_",paste0(n2[x2,2]),"_.*")]<-1
+            } else if (p1==1 & p4==1){
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,1],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0("^",n1[x1,2],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1
+            } else if (p2==1 & p3==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_",paste0(n2[x2,2]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,1]),"_.*")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_",paste0(n2[x2,2]),"_.*")]<-1
+            } else if (p2==1 & p4==1){
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,1],"_.*_",paste0(n2[x2,2]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,1]),"$")]<-1
+              used[n,colnames(used) %like% paste0(".*_",n1[x1,2],"_.*_",paste0(n2[x2,2]),"$")]<-1
+            }
+          }
+        }
+        coefcon<-coefcon[,colnames(design)]
+      }
+      if (complex==1){
+        # Add complex cases All vs All EXCEPT incompatibles
+        # Effect grp1 : Single vs All
+        for (x1 in unique(grp1)){
+          x11<-unique(grp1)[!unique(grp1) %in% x1]
+          for (x3 in incompatible){
+            x33<-x11[!x11 %in% incompatible[!incompatible %in% x3]]
+            if (length(x33)!=0){
+              # Effect Single vs All
+              n<-paste0("(",x1,")-(")
+              for (i in 1:length(x33)){
+                n<-paste0(n,x33[i])
+                if (i!=length(x33)){n<-paste0(n,"-")}
+              }
+              n<-paste0(n,")")
+              used[n,]=0
+              coefcon[n,]<-0
+              coefcon[n,x1]<-1
+              for (x2 in unique(grp2)){
+                coefcon[n,x1]<-1
+                coefcon[n,paste0(x1,":",x2)]<-1/length(unique(grp2))
+                for (i in 1:length(x33)){
+                  coefcon[n,as.character(x33[i])]<--1/length(x33)
+                  coefcon[n,paste0(x33[i],":",x2)]<--1*((1/length(unique(grp2)))/length(x33))
+                
+                  if (p1==1 & p2==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_",paste0(x2),"_.*_.*")]<-1
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_",paste0(x2),"_.*_.*")]<-1
+                  } else if (p1==1 & p3==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_",paste0(x2),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_",paste0(x2),"_.*")]<-1 # Must be verified
+                  } else if (p1==1 & p4==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_",paste0(x2),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_.*_",paste0(x2),"$")]<-1 # Must be verified
+                  } else if (p2==1 & p3==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_",paste0(x2),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_",paste0(x2),"_.*")]<-1 # Must be verified
+                  } else if (p2==1 & p4==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_.*_",paste0(x2),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_.*_",paste0(x2),"$")]<-1 # Must be verified
+                  }
+                }
+              }
+            }
+          }
+        }
+        # Effect grp1-2 : Single_100 vs All_100
+        for (x1 in unique(grp1)){
+          x11<-unique(grp1)[!unique(grp1) %in% x1]
+          for (x3 in incompatible){
+            x33<-x11[!x11 %in% incompatible[!incompatible %in% x3]]
+            if (length(x33)!=0){
+              # Effect Single vs All
+              for (x2 in unique(grp2)){
+                n<-paste0("(",x1,"_",x2,")-(")
+                for (i in 1:length(x33)){
+                  n<-paste0(n,x33[i],"_",x2)
+                  if (i!=length(x33)){n<-paste0(n,"-")}
+                }
+                n<-paste0(n,")")
+                coefcon[n,]<-0
+                coefcon[n,x1]<-1
+                coefcon[n,paste0(x1,":",x2)]<-1
+                used[n,]<-0
+                for (i in 1:length(x33)){
+                  coefcon[n,as.character(x33[i])]<--1/length(x33)
+                  coefcon[n,paste0(x33[i],":",x2)]<--1*(1/length(x33))
+                  
+                  if (p1==1 & p2==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_",paste0(x2),"_.*_.*")]<-1
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_",paste0(x2),"_.*_.*")]<-1
+                  } else if (p1==1 & p3==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_",paste0(x2),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_",paste0(x2),"_.*")]<-1 # Must be verified
+                  } else if (p1==1 & p4==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_",paste0(x2),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_.*_",paste0(x2),"$")]<-1 # Must be verified
+                  } else if (p2==1 & p3==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_",paste0(x2),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_",paste0(x2),"_.*")]<-1 # Must be verified
+                  } else if (p2==1 & p4==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_.*_",paste0(x2),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_.*_",paste0(x2),"$")]<-1 # Must be verified
+                  }
+                  
+                }
+              }
+            }
+          }
+        }
+        # Effect Interaction only : Single_100-Single_250 vs All_100-All_250
+        for (x1 in unique(grp1)){
+          x11<-unique(grp1)[!unique(grp1) %in% x1]
+          for (x3 in incompatible){
+            x33<-x11[!x11 %in% incompatible[!incompatible %in% x3]]
+            if (length(x33)!=0){
+              # Effect Single vs All
+              for (x2 in 1:nrow(n2)){
+                n<-paste0("(",x1,"_",n2[x2,1],"-",x1,"_",n2[x2,2],")-(")
+                for (i in 1:length(x33)){
+                  n<-paste0(n,x33[i],"_",n2[x2,1],"-",x33[i],"_",n2[x2,2])
+                  if (i!=length(x33)){n<-paste0(n,"-")}
+                }
+                n<-paste0(n,")")
+                coefcon[n,]<-0
+                
+                coefcon[n,paste0(x1,":",n2[x2,1])]<-1
+                coefcon[n,paste0(x1,":",n2[x2,2])]<--1
+                
+                used[n,]<-0
+                for (i in 1:length(x33)){
+                  coefcon[n,paste0(x33[i],":",n2[x2,1])]<--1*(1/length(x33))
+                  coefcon[n,paste0(x33[i],":",n2[x2,2])]<-1*(1/length(x33))
+                  
+                  if (p1==1 & p2==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+                    used[n,colnames(used) %like% paste0("^",x1,"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_",paste0(n2[x2,1]),"_.*_.*")]<-1
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_",paste0(n2[x2,2]),"_.*_.*")]<-1
+                  } else if (p1==1 & p3==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_",paste0(n2[x2,1]),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_",paste0(n2[x2,2]),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_",paste0(n2[x2,1]),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_",paste0(n2[x2,2]),"_.*")]<-1 # Must be verified
+                  } else if (p1==1 & p4==1){
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_",paste0(n2[x2,1]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x1,"_.*_.*_",paste0(n2[x2,2]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_.*_",paste0(n2[x2,1]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0("^",x33[i],"_.*_.*_",paste0(n2[x2,2]),"$")]<-1 # Must be verified
+                  } else if (p2==1 & p3==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_",paste0(n2[x2,1]),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_",paste0(n2[x2,2],"_.*"))]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_",paste0(n2[x2,1]),"_.*")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_",paste0(n2[x2,2]),"_.*")]<-1 # Must be verified
+                  } else if (p2==1 & p4==1){
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_.*_",paste0(n2[x2,1]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x1,"_.*_",paste0(n2[x2,2]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_.*_",paste0(n2[x2,1]),"$")]<-1 # Must be verified
+                    used[n,colnames(used) %like% paste0(".*_",x33[i],"_.*_",paste0(n2[x2,2]),"$")]<-1 # Must be verified
+                  }
+                }
+              }
+            }
+          }
+        }
+        coefcon<-coefcon[,colnames(design)]
+      }
+    }
+    
+    dir.create(paste0(folder,"/edgeR/",name), showWarnings = FALSE)
+    
+    write.table(design,file=paste0(folder,"/edgeR/",name,"/",name,"_Design.txt"))
+    write.table(coefcon,file=paste0(folder,"/edgeR/",name,"/",name,"_Contrasts.txt"))
+    write.table(used,file=paste0(folder,"/edgeR/",name,"/",name,"_Used.txt"))
+    
+    return(list(design=design,
+              contrasts=coefcon,
+              used=used,
+              fgroup=fgroup
+    ))
+    
+}
+
+########################
+# Function GO analysis : 
+# http://www.bioconductor.org/packages/release/bioc/vignettes/topGO/inst/doc/topGO.pdf
+# Adapted to be more generic
+########################
+dag_geneID2GO<-function(data=NA,
+                        subgenome=NA,
+                        column_id=NA,
+                        column_go=NA,
+                        last
+  ) {
+  
+  if (length(data)==1){
+    x<-functional_annotation[,c(13,12)]
+  
+    ################################################
+    # Remove ChrUn annotations to avoid biases in GO 
+    x<-x[!x$Simp.Gene.ID %like% "TraesCSU",]
+    ################################################
+  
+    if (!is.na(subgenome)){
+      x<-x[x$Simp.Gene.ID %like% paste0("TraesCS[0-9]",subgenome),]
+    }
+    
+    x$`GO.IDs.via.Interpro`<-gsub(";",",",x$`GO.IDs.via.Interpro`,perl=TRUE)
+    x$`GO.IDs.via.Interpro`<-gsub(" ","",x$`GO.IDs.via.Interpro`,perl=TRUE)
+    
+    # Split delimited strings in column and insert as row
+    x<-x %>% separate_rows(GO.IDs.via.Interpro,sep=",")
+    
+    x<-x[x$`GO.IDs.via.Interpro`!=""] # Select only genes with GO annotation
+  } else {
+    x<-data
+    colnames(x)<-c(column_id,column_go)
+    x$GO<-gsub(";",",",x$GO,perl=TRUE)
+    x$GO<-gsub(" ","",x$GO,perl=TRUE)
+    
+    # Split delimited strings in column and insert as row
+    x<-x %>% separate_rows(GO,sep=",")
+    
+    x<-x[x$GO %like% "GO",] # Select only genes with GO annotation
+  }
+  colnames(x)<-c(column_id,column_go)
+  
+  write.table(x,file="temp.txt",sep="\t",quote=FALSE,row.names = FALSE,col.names = FALSE)
+  
+  geneID2GO <- readMappings(file = "temp.txt")
+  GO2geneID <- inverseList(geneID2GO)
+  geneID2GO <- inverseList(GO2geneID) # Added to fix the list because we need grouped GOs per gene rather than one GO per line with repeated geneIDs. Otherwise it only takes first GO per gene.
+
+    
+  # Adapt to FGN_test
+  if (1==1){
+    # GO:0003674 is the MF root.
+    # GO:0005575 is the CC root.
+    # GO:0008150 is the BP root.
+    
+    MF<-GOMFOFFSPRING$"GO:0003674"
+    CC<-GOCCOFFSPRING$"GO:0005575"
+    BP<-GOBPOFFSPRING$"GO:0008150" 
+    
+    MF_x<-x[x$GO %in% MF,]
+    CC_x<-x[x$GO %in% CC,]
+    BP_x<-x[x$GO %in% BP,]
+    
+    MF_x[,"Ontology"]<-"MF"
+    CC_x[,"Ontology"]<-"CC"
+    BP_x[,"Ontology"]<-"BP"
+    
+    tableGoGenes<-rbind (MF_x,CC_x,BP_x)
+    colnames(tableGoGenes)<-c("GENENAME","GO","ONTOLOGY")
+
+    tableGoGenesSplit <- split(tableGoGenes, tableGoGenes$ONTOLOGY) # Split by ontology
+    tableGoGenesSplit <- tableGoGenesSplit[which(paste("GO_", names(tableGoGenesSplit), sep="") %in% c("GO_BP","GO_MF","GO_CC"))] # Select the requested ontologies
+    
+    geneID2GO_x <- lapply(tableGoGenesSplit, function(x) split(as.character(x$GO),x[,"GENENAME"]))
+    GO2geneID_x <- lapply(tableGoGenesSplit, function(x) split(x[,"GENENAME"], as.character(x$GO)))
+  }
+  return(list(geneID2GO=geneID2GO,
+              GO2geneID=GO2geneID,
+              geneID2GO_x=geneID2GO_x,
+              GO2geneID_x=GO2geneID_x,
+              tableGoGenes=tableGoGenes,
+              tableGoGenesSplit=tableGoGenesSplit
+  ))
+}
+
+
+dag_GO<-function(data,
+         name=NA, # Analysis name
+         ontology="BP", # Biological Process, Cellular Component, Molecular Function
+         folder=folder, # Folder name to save results
+         geneID2GO=NULL,
+         genesUniverse=NULL,
+         last
+  ) {
+
+  if (is.null(geneID2GO)){
+    x<-dag_geneID2GO()
+    geneID2GO<-x$geneID2GO
+    GO2geneID<-x$GO2geneID
+    geneID2GO_x<-x$geneID2GO_x
+    GO2geneID_x<-x$GO2geneID_x
+  }
+
+  # Adapt geneid column to Geneid if necessary
+  if (sum(colnames(data) %in% "geneid")==1){names(data)[names(data) == 'geneid'] <- "Geneid"}
+  
+  # Gene Universe
+  if (is.null(genesUniverse)){
+    genesUniverse <- unique(names(geneID2GO))
+  }
+   
+  # Genes of interest
+  myInterestingGenes <- data$Geneid
+  geneList<-myInterestingGenes
+  geneListvector <- factor(as.integer(genesUniverse %in% myInterestingGenes))
+  names(geneListvector) <- genesUniverse
+  str(geneListvector)
+  
+  # Construct GO object
+  GOdata_BP <- new("topGOdata", ontology = "BP", allGenes = geneListvector, annot = annFUN.gene2GO, gene2GO = geneID2GO)
+  GOdata_CC <- new("topGOdata", ontology = "CC", allGenes = geneListvector, annot = annFUN.gene2GO, gene2GO = geneID2GO)
+  GOdata_MF <- new("topGOdata", ontology = "MF", allGenes = geneListvector, annot = annFUN.gene2GO, gene2GO = geneID2GO)
+
+  # Recover all genes per GO (including "back progagation") 
+  tempBP = genesInTerm(GOdata_BP)
+  tempBP <- do.call(rbind, lapply(tempBP, as.data.frame))
+  tempBP$GO<-row.names(tempBP)
+  colnames(tempBP)<-c("Col1","Col2")
+  tempBP$Col2 <- gsub("\\.[0-9]+","",tempBP$Col2,perl=TRUE)
+  tempBPgene2GO <- tempBP %>%
+                    dplyr::group_by(Col1) %>%
+                    dplyr::summarise(Col2 = paste(Col2, collapse = ","))
+  tempBPGO2gene <- tempBP %>%
+                    dplyr::group_by(Col2) %>%
+                    dplyr::summarise(Col1 = paste(Col1, collapse = ","))
+  tempBPgene2GO <- as.data.table(tempBPgene2GO)
+  colnames(tempBPgene2GO)<-c("Gene","GO")
+  tempBPGO2gene <- as.data.table(tempBPGO2gene)
+  colnames(tempBPGO2gene)<-c("GO","Gene")
+  
+  tempCC<-genesInTerm(GOdata_CC)
+  tempCC <- do.call(rbind, lapply(tempCC, as.data.frame))
+  tempCC$Col2<-row.names(tempCC)
+  colnames(tempCC)<-c("Col1","Col2")
+  tempCC$Col2 <- gsub("\\.[0-9]+","",tempCC$Col2,perl=TRUE)
+  tempCCgene2GO <- tempCC %>%
+                    dplyr::group_by(Col1) %>%
+                    dplyr::summarise(Col2 = paste(Col2, collapse = ","))
+  tempCCGO2gene <- tempCC %>%
+                    dplyr::group_by(Col2) %>%
+                    dplyr::summarise(Col1 = paste(Col1, collapse = ","))
+  tempCCgene2GO <- as.data.table(tempCCgene2GO)
+  colnames(tempCCgene2GO)<-c("Gene","GO")
+  tempCCGO2gene <- as.data.table(tempCCGO2gene)
+  colnames(tempCCGO2gene)<-c("GO","Gene")
+  
+  tempMF<-genesInTerm(GOdata_MF)
+  tempMF <- do.call(rbind, lapply(tempMF, as.data.frame))
+  tempMF$Col2<-row.names(tempMF)
+  colnames(tempMF)<-c("Col1","Col2")
+  tempMF$Col2 <- gsub("\\.[0-9]+","",tempMF$Col2,perl=TRUE)
+  tempMFgene2GO <- tempMF %>%
+                    dplyr::group_by(Col1) %>%
+                    dplyr::summarise(Col2 = paste(Col2, collapse = ","))
+  tempMFGO2gene <- tempMF %>%
+                    dplyr::group_by(Col2) %>%
+                    dplyr::summarise(Col1 = paste(Col1, collapse = ","))
+  tempMFgene2GO <- as.data.table(tempMFgene2GO)
+  colnames(tempMFgene2GO)<-c("Gene","GO")
+  tempMFGO2gene <- as.data.table(tempMFGO2gene)
+  colnames(tempMFGO2gene)<-c("GO","Gene")
+  
+  write.table(tempBPgene2GO,file=paste0(folder,"GO_allRes_",name,"_BP_gene2GO.txt"),col.names=TRUE)
+  write.table(tempBPGO2gene,file=paste0(folder,"GO_allRes_",name,"_BP_GO2gene.txt"),col.names=TRUE)
+  write.table(tempCCgene2GO,file=paste0(folder,"GO_allRes_",name,"_CC_gene2GO.txt"),col.names=TRUE)
+  write.table(tempCCGO2gene,file=paste0(folder,"GO_allRes_",name,"_CC_GO2gene.txt"),col.names=TRUE)
+  write.table(tempMFgene2GO,file=paste0(folder,"GO_allRes_",name,"_MF_gene2GO.txt"),col.names=TRUE)
+  write.table(tempMFGO2gene,file=paste0(folder,"GO_allRes_",name,"_MF_GO2gene.txt"),col.names=TRUE)
+  
+
+  # Calculate the stats
+  test.stat_clasfi <- new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+  test.stat_clasks <- new("classicScore", testStatistic = GOKSTest, name = "KS tests")
+  test.stat_elim <- new("elimScore", testStatistic = GOKSTest, name = "Fisher test", cutOff = 0.01)
+  test.stat_weight <- new("weightCount", testStatistic = GOFisherTest, name = "Fisher test", sigRatio = "ratio")
+
+  resultFisher_BP <- getSigGroups(GOdata_BP, test.stat_clasfi)
+  resultKS_BP <- getSigGroups(GOdata_BP, test.stat_clasks)
+  resultElim_BP <- getSigGroups(GOdata_BP, test.stat_elim)
+  resultWeight_BP <- getSigGroups(GOdata_BP, test.stat_weight)
+
+  resultFisher_CC <- getSigGroups(GOdata_CC, test.stat_clasfi)
+  resultKS_CC <- getSigGroups(GOdata_CC, test.stat_clasks)
+  resultElim_CC <- getSigGroups(GOdata_CC, test.stat_elim)
+  resultWeight_CC <- getSigGroups(GOdata_CC, test.stat_weight)
+
+  resultFisher_MF <- getSigGroups(GOdata_MF, test.stat_clasfi)
+  resultKS_MF <- getSigGroups(GOdata_MF, test.stat_clasks)
+  resultElim_MF <- getSigGroups(GOdata_MF, test.stat_elim)
+  resultWeight_MF <- getSigGroups(GOdata_MF, test.stat_weight)
+
+
+  # Fisher: For each GO category, compares the expected number of significant genes at random to the observed number of significant genes, and get a p-value. Significant genes: hard cut-off based on p-value or score
+  # Classic: Each node is tested independently
+  # Elim: Testing from bottom up (starting from most specific node). If tested significant in a child node, these genes would not contribute to parental node
+  # Weight: A weightinig scheme for genes contribution towards neighboring term
+  # KS: Kolmogorov-Smirnov. Needs a DE gene list + pvalues (or score). The KS test Compares the distribution of gene p-values expected at random to the observed distribution of the gene p-values to arrive at a probability. No cutoff is needed. Input file include all genes with p-value and score
+  allRes_BP <- GenTable(GOdata_BP, classic = resultFisher_BP, KS = resultKS_BP, elim=resultElim_BP, weight = resultWeight_BP, orderBy = "weight", ranksOf = "classic", topNodes = length(usedGO(GOdata_BP))) #topNodes = 200)
+  allRes_CC <- GenTable(GOdata_CC, classic = resultFisher_CC, KS = resultKS_CC, elim=resultElim_CC, weight = resultWeight_CC, orderBy = "weight", ranksOf = "classic",  topNodes = length(usedGO(GOdata_CC))) #topNodes = 200)
+  allRes_MF <- GenTable(GOdata_MF, classic = resultFisher_MF, KS = resultKS_MF, elim=resultElim_MF, weight = resultWeight_MF, orderBy = "weight", ranksOf = "classic",  topNodes = length(usedGO(GOdata_MF))) #topNodes = 200)
+
+  allRes_BP$Significant_expected_ratio<-allRes_BP$Significant/allRes_BP$Expected
+  allRes_CC$Significant_expected_ratio<-allRes_CC$Significant/allRes_CC$Expected
+  allRes_MF$Significant_expected_ratio<-allRes_MF$Significant/allRes_MF$Expected
+  
+  saveRDS(GOdata_BP,file=paste0(folder,"GO_data_",name,"_BP.Rds"))
+  saveRDS(GOdata_CC,file=paste0(folder,"GO_data_",name,"_CC.Rds"))
+  saveRDS(GOdata_MF,file=paste0(folder,"GO_data_",name,"_MF.Rds"))
+  
+  saveRDS(allRes_BP,file=paste0(folder,"GO_allRes_",name,"_BP.Rds"))
+  saveRDS(allRes_CC,file=paste0(folder,"GO_allRes_",name,"_CC.Rds"))
+  saveRDS(allRes_MF,file=paste0(folder,"GO_allRes_",name,"_MF.Rds"))
+  
+  write.table(allRes_BP,file=paste0(folder,"GO_allRes_",name,"_BP.txt"),col.names=TRUE)
+  write.table(allRes_CC,file=paste0(folder,"GO_allRes_",name,"_CC.txt"),col.names=TRUE)
+  write.table(allRes_MF,file=paste0(folder,"GO_allRes_",name,"_MF.txt"),col.names=TRUE)
+  
+  saveRDS(resultFisher_BP,file=paste0(folder,"GO_resultFisher_",name,"_BP.Rds"))
+  saveRDS(resultKS_BP,file=paste0(folder,"GO_resultKS_",name,"_BP.Rds"))
+  saveRDS(resultElim_BP,file=paste0(folder,"GO_resultElim_",name,"_BP.Rds"))
+  saveRDS(resultWeight_BP,file=paste0(folder,"GO_resultWeight_",name,"_BP.Rds"))
+
+  saveRDS(resultFisher_CC,file=paste0(folder,"GO_resultFisher_",name,"_CC.Rds"))
+  saveRDS(resultKS_CC,file=paste0(folder,"GO_resultKS_",name,"_CC.Rds"))
+  saveRDS(resultElim_CC,file=paste0(folder,"GO_resultElim_",name,"_CC.Rds"))
+  saveRDS(resultWeight_CC,file=paste0(folder,"GO_resultWeight_",name,"_CC.Rds"))
+  
+  saveRDS(resultFisher_MF,file=paste0(folder,"GO_resultFisher_",name,"_MF.Rds"))
+  saveRDS(resultKS_MF,file=paste0(folder,"GO_resultKS_",name,"_MF.Rds"))
+  saveRDS(resultElim_MF,file=paste0(folder,"GO_resultElim_",name,"_MF.Rds"))
+  saveRDS(resultWeight_MF,file=paste0(folder,"GO_resultWeight_",name,"_MF.Rds"))
+
+
+  printGraph(GOdata_BP, resultWeight_BP, firstSigNodes = 10, resultFisher_BP, fn.prefix = paste0(folder,"GO_",name,"_BP"), useInfo = "def", pdfSW = TRUE)
+  printGraph(GOdata_CC, resultWeight_CC, firstSigNodes = 10, resultFisher_CC, fn.prefix = paste0(folder,"GO_",name,"_CC"), useInfo = "def", pdfSW = TRUE)
+  printGraph(GOdata_MF, resultWeight_MF, firstSigNodes = 10, resultFisher_MF, fn.prefix = paste0(folder,"GO_",name,"_MF"), useInfo = "def", pdfSW = TRUE)
+  
+  
+  return(list(allRes_BP=allRes_BP,
+              allRes_CC=allRes_CC,
+              allRes_MF=allRes_MF
+  ))
+}
+```
+
+================
+
+Load data files
+
+```{r}
+correspondance_file<-"~/Library/CloudStorage/OneDrive-Uppsalauniversitet/PhD/Research/G.buenoi-DGE/files/correspondance_flybasewithcurated_wingbuds.csv" # Format : order	name	file_name	correspondance	group_1	group_2	group_3	group_4 separated by "," 
+# Example: 1,A2-18-1,/proj/snic2019-35-58/water_strider/RNA-seq_wing_bud/STAR_bam_output/A2-18-1.bam,A_4E_18_2,A,4E,18,2 # Note: A2-18-1.bam correspond to the featurecounts column name, it is not an actual bam file. # Note 2: group_4 corresponds to replicate number
+functional_annotation_file<-NULL # Gene-ID	is_repr	AHRD-Quality-Code	Blast-Hit-Accession	Human-Readable-Description	Pfam-IDs-(Description)	Interpro-IDs-(Description)	GO-IDs-(Description)-via-Interpro	Gene-or-TE-TE?-U (via-function)	Pfam-IDs	Interpro-IDs	GO-IDs-via-Interpro
+# Essential columns : Gene.ID and Human.Readable.Description
+# Attention: Gene.ID names are simplified, i.e. ending .[0-9] is removed
+chromosome_size_file<-NULL
+subgenomes_file<-NULL
+gff3_file<-"~/Library/CloudStorage/OneDrive-Uppsalauniversitet/PhD/Research/G.buenoi-DGE/files/genome.genes.flybasewithcurated.gff3"
+
+loadedfiles<-dag_load_files(
+  correspondance_file=correspondance_file,
+  functional_annotation_file=functional_annotation_file,
+  chromosome_size_file=chromosome_size_file,
+  subgenomes_file=subgenomes_file,
+  gff3_file=gff3_file
+)
+
+if (!is.null(loadedfiles$correspondance)){if(nrow(loadedfiles$correspondance)!=0){correspondance=loadedfiles$correspondance}}
+if (!is.null(loadedfiles$functional_annotation)){if(nrow(loadedfiles$functional_annotation)!=0){functional_annotation=loadedfiles$functional_annotation}}
+if (!is.null(loadedfiles$chrom_size)){if(nrow(loadedfiles$chrom_size)!=0){chrom_size=loadedfiles$chrom_size}}
+if (!is.null(loadedfiles$subgenomes)){if(nrow(loadedfiles$subgenomes)!=0){subgenomes=loadedfiles$subgenomes}}
+if (!is.null(loadedfiles$gff_annotation)){if(nrow(loadedfiles$gff_annotation)!=0){gff_annotation=loadedfiles$gff_annotation}}
+if (!is.null(loadedfiles$gene_coordinates)){if(nrow(loadedfiles$gene_coordinates)!=0){gene_coordinates=loadedfiles$gene_coordinates}}
+
+# Free some memory
+rm(loadedfiles)
+```
+
+Load FeatureCounts data and create DEGList object
+
+Check readDGE function
+```{r}
+
+dag_readfiles_modified <- function(files, readsfolder=NULL, readsprefix=NULL, readssufix=NULL,correspondance=NULL,consolidateprojectreads=NULL,gene_coordinates=NULL,reduceprojectreads=NULL,columns_or_file_names="file") {
+  #l <- 1
+  for (l in 1:length(files)){
+    i=files[l]
+
+    j=""  
+    for (fol in readsfolder){
+      for (pre in readsprefix){
+        for (suf in readssufix){
+          t=paste0(fol,pre,i,suf)
+          if (file.exists(t)){
+            j=t
+          }
+          else (print(paste0("Error: files ",t," doesn't exists")))
+        } 
+      }      
+    }
+
+    y=fread(j,header=TRUE,sep="\t",na.strings=".")#,skip=1) 
+    colnames(y)[1:6]<-c("Geneid","Chr","Start","End","Strand","Length")
+
+    ##########################################
+    # Filter out here once for all ChrUn genes
+    y<-y[!y$Chr %like% "chrUn",]
+    ##########################################
+    #ll <- 7
+    for (ll in 7:length(colnames(y))){
+      lll<-colnames(y)[ll]
+      colnames(y)[ll]<-"sample"
+      if (l==1 & ll==7){
+        counts<-y[,c("Geneid","sample")]
+        genes<-y[,c("Geneid","Length")]
+        colnames(y)[ll]<-lll
+      } else {
+        counts<-merge(counts,y[,c("Geneid","sample")], by="Geneid",all=TRUE);counts[is.na(counts)] <- 0
+        if (y[,c("Geneid")] %in% genes[,c("Geneid")]){ # If we have new genes. i.e. reading samples from another a bam with only subgenome D and another from a bam with subgenome ABD
+          genes<-merge(genes,y[!y$Geneid %in% genes$Geneid,c("Geneid","Length")], by=c("Geneid","Length"),all=TRUE)
+        }
+        colnames(y)[ll]<-lll
+      }
+      if (columns_or_file_names %in% "file"){
+        i<-correspondance[correspondance$file_name %in% i , "correspondance"] # This allow to fix samples problems like i.e. Langdon 500T1 250T2
+        names(counts)[names(counts) == 'sample'] <- as.character(i$correspondance) # I had to do this and use an intermediate 'sample' name because merge doesn't want to use a variable i directly. Need to check this in the future
+      }
+      else if (columns_or_file_names %in% "columns"){
+        print(lll)
+        i<-correspondance$correspondance[correspondance$file_name %in% lll]
+        names(counts)[names(counts) == "sample"] <- as.character(i) # I had to do this and use an intermediate 'sample' name because merge doesn't want to use a variable i directly. Need to check this in the future
+      }
+    }
+  }
+
+  # Used it we have multiple copies of the same data. Developed to take into account original unsuccessful sequencing of brachy as well as the redone sequencing
+  if (length(consolidateprojectreads)!=0){ 
+    temp<-as.data.frame(counts)
+    rownames(temp)<-temp[,"Geneid"]
+    temp<-temp[,!colnames(temp) %in% "Geneid"]
+    
+    colnames(temp)<-gsub(consolidateprojectreads,"",colnames(temp),perl=TRUE)
+    temp2<-unique(colnames(temp))
+  
+    temp<-t(rowsum(t(temp), group = colnames(temp), na.rm = T)) # https://stackoverflow.com/questions/35626945/row-wise-sum-of-values-grouped-by-columns-with-same-name
+    temp<-as.data.frame(temp)
+    temp[,"Geneid"]<-rownames(temp)
+    temp<-as.data.table(temp)
+    PROJECT_files<-temp2
+    temp2<-c("Geneid",temp2)
+    counts<-  temp[,..temp2]
+  }
+  
+  # Changes samples names
+  x<-colnames(counts[,2:ncol(counts)])
+  y<-correspondance[correspondance %in% x,c("correspondance","new_name")]
+  t<-y[match(x, y$correspondance),]$new_name
+  colnames(counts)<-c("Geneid",t)
+  t<-sort(t)
+  t<-c("Geneid",t)
+  counts<-counts[,..t]
+  #
+  projectreads<-dag_readsummary(counts=counts,lengths=genes,files=PROJECT_files,correspondance_files=correspondance)
+  if (length(gene_coordinates)!=0){
+    projectreads$genes<-unique(merge(projectreads$genes,gene_coordinates[Gene %in% projectreads$genes$Geneid,c("Chromosome","Gene")],by.x="Geneid",by.y="Gene"))
+  }
+  if (length(reduceprojectreads)!=0){
+    projectreads <- projectreads[, colnames(projectreads[,colnames(projectreads) %like% reduceprojectreads]) , keep.lib.sizes=FALSE]
+  }
+  rownames(projectreads$genes)<-projectreads$genes$Geneid
+ 
+  # Make sure order of genes is the same in projectreads$genes is the same as in projectreads$counts. Otherwise we can have problems later when filtering with keep
+  projectreads$genes<-projectreads$genes[sort(projectreads$genes$Geneid),]
+  projectreads$counts<-projectreads$counts[sort(projectreads$genes$Geneid),]
+  
+  return(projectreads)
+}
+
+```
+
+
+```{r}
+readsfolder<-c("~/Library/CloudStorage/OneDrive-Uppsalauniversitet/PhD/Research/G.buenoi-DGE/files/")
+readsprefix<-c("")
+readssufix<-c("")
+PROJECT_files <- c("subread_counts_wingbuds.txt")  # It can be single featureCounts file with all the samples or contain the names of all the individual featureCoutns files
+
+  
+projectreads<-dag_readfiles_modified(files=PROJECT_files,readsfolder=readsfolder,readsprefix=readsprefix,readssufix=readssufix,correspondance=correspondance,gene_coordinates=gene_coordinates,columns_or_file_names="columns")
+  
+assign(paste0("wingbuds_new"),projectreads)
+```
+
+Define run parameters Eight approach : After various preliminary tests, remove samples C_5E_18_3 ; D_5L_18_5 ; D_5L_18_1 ; D_5L_18_2 ; W_5L_12_4 ; Y_4L_12_3 ; B_4L_18_1.
+
+We can also set the parameters for the edgeR pipeline.
+
+```{r}
+o<-get("wingbuds_new")
+o=o[ , !colnames(o) %in% c("C_5E_18_3","D_5L_18_5","D_5L_18_1","D_5L_18_2","W_5L_12_4","Y_4L_12_3","B_4L_18_1") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("A_4E_18_2","A_4E_18_3","A_4E_18_4","A_4E_18_5","A_4E_18_6","A_4E_18_7") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("B_4L_18_2","B_4L_18_5","B_4L_18_6","B_4L_18_7") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("C_5E_18_1","C_5E_18_2","C_5E_18_4","C_5E_18_5","C_5E_18_7") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("D_5L_18_3","D_5L_18_4","D_5L_18_6") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("W_5L_12_1","W_5L_12_2","W_5L_12_3","W_5L_12_5") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("X_4E_12_2","X_4E_12_3","X_4E_12_4","X_4E_12_5","X_4E_12_6","X_4E_12_7") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("Y_4L_12_1","Y_4L_12_5","Y_4L_12_6","Y_4L_12_7","Y_4L_12_8") , keep.lib.sizes=FALSE]
+#o=o[ , !colnames(o) %in% c("Z_5E_12_1","Z_5E_12_2","Z_5E_12_3","Z_5E_12_4","Z_5E_12_5","Z_5E_12_7") , keep.lib.sizes=FALSE]
+
+o<-dag_simplify_groups(o)
+assign("wingbuds_new", o)
+
+dag_prefix<-c("wingbuds_new")
+dag_complete_prefix<-c("wingbuds_new")
+dag_complete_prefix_2<-c("wingbuds_new")
+dag_prefix2="wingbuds_new"
+#dag_prefix2="D-W"
+
+# Parameters
+filter="cpm"
+#filter="allreplicates" # Filter as at least all replicates in a given sample have > filtermin
+#filter="samplesreplicates" # Filter by samples/replicates as Marie Laure   
+filtermin=5 # Minimum number of reads for a gene to not be filtered out.
+filterminlib=3 # Minimum number of libraries per treatment where "filtermin" must be true.
+padjusted=0.01
+dag_withnames=1 # 1=Group_1; 2=Group_2; 4=Group_3; 8=Group_4; 0=None; 3=1+2 ; 5=1+4, etc... 
+DEGonly=0 #0 = NO, so it will produce PCAs and so on, 1 = YES, and it will only compare treatments pairwise and generate all the plots.
+runedgeR=1 #0 = NO, and it will only run preliminary analyses, 1 = YES and all the analyses in edgeR will be performed.
+dag_plot_pairs_heatmap="no"
+filter_low=filter 
+dag_incompatible = c("") # Incompatible sample to avoid analysis during complex interactions. I.e.: "L","T","C0","C2"
+dag_simple=1 # Calculate simple interactions
+dag_complex=0  # Calculate complex interactions like (4E)-(4L-5E-5L) or (4E_18)-(4L_18-5E_18-5L_18) or (4E_18-4E_12)-(4L_18-4L_12-5E_18-5E_12-5L_18-5L_12)
+#dag_subgenomes= c("A","B","D")
+dag_subgenomes= c("none")
+dag_model_method="QLF" # LRT , QLF or both
+dag_contrast1=0
+dag_contrast2=1
+dag_contrast3=1
+dag_contrast4=0
+dag_already_lib_normalized=0
+
+dag_filter_contrast=0 # 1 = Filter contrasts to retain only the ones containing a "-" in the first part. I.e.: complex or (A_100-A_250) and leave only single species comparisons i.e. (A_100-A_250)
+                      # 2 = Filter contrasts to retain only the ones containing a "_" but no "-" in the first part. I.e.: complex like (C0_100)-(L_100-R_100)
+                      # 3 = Filter contrasts to retain only the ones containing a "_" and one "-" in the first part. I.e.: complex like (5E_18-5E_12)-(5L_18-5L_12)
+                      # 4 = Option 1 + 2
+```
+
+# PIPELINE
+
+Define folders name and calculate everything
+
+```{r}
+if (1==1){
+    for (prefix in unique(c(dag_complete_prefix_2,dag_prefix))){
+      for (subgenome in dag_subgenomes){
+        if (subgenome=="none" | (
+          prefix %like% "^[a-zA-Z]*_[0-9]"  | # Because if I have already splitted by subgenomes we don't need to do it again
+          (subgenome=="A" & prefix %like% "^.*_A_") |
+          (subgenome=="B" & prefix %like% "^.*_B_") |
+          (subgenome=="D" & prefix %like% "^.*_D_") )){
+      
+          names<-dag_folders_name(prefix,dag_prefix2,subgenome,filtermin=filtermin,filterminlib=filterminlib,filter_low=filter_low,padjusted=padjusted)
+          name=names$name
+          folder=names$folder
+          folderPCA=names$folderPCA
+          folderData=names$folderData
+          folderUpset=names$folderUpset
+          folderedgeR=names$folderedgeR
+          folderDensities=names$folderDensities
+          folderGO=names$folderGO
+          
+          data<-get(paste0(name))
+          
+          
+          # Lets calculate some general statistics
+          # "#9e0142","#d53e4f","#f46d43","#fdae61","#fee08b","#e6f598","#abdda4","#66c2a5","#3288bd","#5e4fa2"
+          # library(scales);show_col(hue_pal()(10)) # Mimic ggplot2 colours
+          # "#F8799D","#D89000","#A3A500","#39B600","#00BF7D","#00BFC4","#00B0F6","#9590FF","#E76BF3","#FF62BC"
+          
+          if (exists("dag_colours_1")){
+            if (subgenome %in% c("A","B")){colours_1=dag_colours_1;shapes_1=dag_shapes_1}
+            if (subgenome %in% c("D")){colours_1=dag_colours_2;shapes_1=dag_shapes_2}
+          } else {
+            if (subgenome %in% c("A","B")){colours_1=c("#D89000","#39B600","#00BF7D","#F8799D","#FF62BC","#A3A500","#9590FF","#E76BF3","#00B0F6");shapes_1=c(0,1,2,3,4,5,6,7,8)}
+            if (subgenome %in% c("D")){colours_1=c("#D89000","#39B600","#00BF7D","#F8799D","#FF62BC","#9590FF","#E76BF3","#00B0F6","#A3A500");shapes_1=c(0,1,2,3,4,6,7,8,5)}
+          }
+            
+          if (subgenome %in% c("A","B","D")){
+            if (dag_withnames!=0){
+              stats<-dag_DE(data=data,name=name,filter=filter_low,filtermin=filtermin,filterminlib=filterminlib,plot_pairs_heatmap=dag_plot_pairs_heatmap,padjusted = padjusted,DEGonly=DEGonly,runedgeR=0,folder=folder,colours_1=colours_1,shapes_1=shapes_1,already_lib_normalized=dag_already_lib_normalized,withnames=dag_withnames)
+            } else{
+              stats<-dag_DE(data=data,name=name,filter=filter_low,filtermin=filtermin,filterminlib=filterminlib,plot_pairs_heatmap=dag_plot_pairs_heatmap,padjusted = padjusted,DEGonly=DEGonly,runedgeR=0,folder=folder,colours_1=colours_1,shapes_1=shapes_1,already_lib_normalized=dag_already_lib_normalized)
+            }
+          } else {
+            if (dag_withnames!=0){
+              stats<-dag_DE(data=data,name=name,filter=filter_low,filtermin=filtermin,filterminlib=filterminlib,plot_pairs_heatmap=dag_plot_pairs_heatmap,padjusted = padjusted,DEGonly=DEGonly,runedgeR=0,folder=folder,already_lib_normalized=dag_already_lib_normalized,withnames=dag_withnames)
+            } else {
+              stats<-dag_DE(data=data,name=name,filter=filter_low,filtermin=filtermin,filterminlib=filterminlib,plot_pairs_heatmap=dag_plot_pairs_heatmap,padjusted = padjusted,DEGonly=DEGonly,runedgeR=0,folder=folder,already_lib_normalized=dag_already_lib_normalized)
+            }
+          }
+          
+          
+          
+          sample_filtered=stats$sample_filtered
+          sample_filtered_TMM=stats$sample_filtered_TMM
+          sample_filtered_TMM_use=stats$sample_filtered_TMM_use
+          sample_highexpressed_filtered_TMM=stats$sample_highexpressed_filtered_TMM
+          sample_highexpressed_filtered_TMM_use=stats$sample_highexpressed_filtered_TMM_use
+
+          #### Custom PCA plot for Eric
+          #############################
+          if (1==2){
+            t<-dag_PCA(sample_filtered_TMM_use,name=paste0(name,"_All"),folder=folderPCA)
+  
+            mds<-t
+            eig_pc <- round((mds$eig * 100 / sum(mds$eig)),2)
+    
+            mds_df<-as.data.frame(cbind(mds$points[,1],mds$points[,2]))
+            mds_df[,"Sample"]<-rownames(mds_df)
+            mds_df$Group<-mds_df$Sample
+            mds_df$Group<-gsub("^[A-Z]_[0-9]","",mds_df$Group,perl=TRUE)
+            mds_df$Group<-gsub("_[0-9]*$","",mds_df$Group,perl=TRUE)
+            mds_df$Group<-as.character(mds_df$Group)
+  
+            xlabel=print(paste("PC1 (",eig_pc[1]," %)"))
+            ylabel=print(paste("PC2 (",eig_pc[2]," %)"))
+            colnames(mds_df)<-c("PC1","PC2","Sample","Group")
+      
+            mds_df$Group <- factor(mds_df$Group, levels = as.character(mixedsort(unique(mds_df$Group)))) 
+  
+            mds_df$Photoperiod<-gsub("^[A-Z]_","",mds_df$Group,perl=TRUE)
+            mds_df$Development<-gsub("_[0-9]*$","",mds_df$Group,perl=TRUE)
+            mds_df$Development<-gsub("E","Early",mds_df$Development,perl=TRUE)
+            mds_df$Development<-gsub("L","Late",mds_df$Development,perl=TRUE)
+            mds_df$Sample<-gsub("^[A-Z]_","",mds_df$Sample,perl=TRUE)
+            mds_df$Sample<-gsub("_[0-9]*$","",mds_df$Sample,perl=TRUE)
+            mds_df$Stage<-gsub("[A-Z]_[0-9]*$","",mds_df$Sample,perl=TRUE)
+  
+            gg<- ggplot(mds_df, aes(PC1,PC2)) +
+              geom_encircle(aes(group=Sample,color=Development,linetype=Stage),size=2) + #,expand=0.02) +
+              geom_point(aes(shape=Photoperiod,color=Development),size=2) + 
+              scale_color_manual(values=c("#666666","#999999")) + 
+              labs(title=name) + xlab(xlabel) + ylab(ylabel)
+            
+            ggsave(filename=paste0(folder,"PCA_MDS_PC1_PC2_",name,"_personalized_for_Eric.jpg")
+  , plot=gg, width=15, height=15,dpi=300,units=c("cm"))
+            
+            # 2nd custom version (needs to run version 1 first)
+            mds_df$Instar<-mds_df$Sample
+            mds_df$Instar<-gsub("_.*","",mds_df$Instar)
+            mds_df$Instar<-gsub("^","i",mds_df$Instar)
+            
+            #brewer.pal(n=8,name="Dark2")
+            ggg<- ggplot(mds_df, aes(PC1,PC2)) +
+              geom_encircle(aes(group=Instar,linetype=Instar),size=3) + #,expand=0.02) +
+              geom_point(aes(shape=Instar,color=Photoperiod),size=4) + 
+              scale_color_manual(values=c("#1B9E77","#D95F02")) +
+              scale_shape_manual(values=c(15,16,17,18)) +
+  scale_linetype_manual(values=c("solid","dotdash","longdash", "dotted")) +
+              labs(title="") + xlab(xlabel) + ylab(ylabel) + 
+              theme(legend.key.width=unit(3,"cm"), text = element_text(size = 20))   
+              ggsave(filename=paste0(folder,"PCA_MDS_PC1_PC2_",name,"_personalized_for_Eric_2.jpg"), plot=ggg, width=20, height=15,dpi=300,units=c("cm"))
+          }
+          #### End custom
+          #############################    
+          
+          saveRDS(sample_filtered_TMM,file=paste0(folder,"sample_filtered_TMM.Rds"))
+                    
+          sample_rpkm=rpkm(sample_filtered_TMM,log=FALSE)
+          sample_rpkm[sample_rpkm<1]=0
+          sample_rpkm[sample_rpkm>=1]=1
+          sample_rpkm<-as.data.frame(sample_rpkm)
+      
+      
+          if (load_data_only!=1){
+            jpeg(paste0(folderUpset,name,"_rpkm.jpeg"))
+            upset(sample_rpkm,nsets=ncol(sample_rpkm),order.by = "freq",nintersects=20,keep.order=TRUE,text.scale=c(1,1,1,1,0.3,2))
+            dev.off()
+            
+            # Shared expression barplot
+            head(sample_rpkm)
+            total<-sample_filtered_TMM$genes
+            all_shared<-sample_rpkm[(rowSums(sample_rpkm == 1) == length(sample_rpkm)),]
+            genes_count = data.table(
+              sample = c(colnames(sample_rpkm)),
+              unique = c(1:length(sample_rpkm)),
+              shared = c(1:length(sample_rpkm)),
+              all_shared = c(1:length(sample_rpkm)),
+              total = c(1:length(sample_rpkm))
+            )
+            sample_rpkm$rowsum<-rowSums(sample_rpkm)
+            for (i in 1:length(sample_rpkm-1)){
+              genes_count[i,2]<-sum(sample_rpkm[,i]==1 & sample_rpkm[,"rowsum"]==1)
+              genes_count[i,3]<-sum(sample_rpkm[,i]==1 & sample_rpkm[,"rowsum"]!=1)-nrow(all_shared)
+              genes_count[i,4]<-nrow(all_shared)
+              genes_count[i,5]<-nrow(total)-(sum(sample_rpkm[,i]==1)-nrow(all_shared))
+            }
+            t<-gather(genes_count,"unique","shared","total",2:5)
+            colnames(t)<-c("Sample","Condition","Genes")
+            t$Condition_2<-factor(t$Condition,c("total","unique","shared","all_shared"))
+            t<-ggplot(t,aes(fill=Condition_2, y=Genes, x=Sample))+geom_bar(stat="identity") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) # rpkm_stackplot
+            n<-paste0(folder,name,"_RPKM_higher_than_1_stackplot.jpg")
+            ggsave(filename=n, plot=t, width=8, height = 6)
+            
+            # RPKM stackplot
+            sample_rpkm=rpkm(sample_filtered_TMM,log=FALSE)
+            dag_stackplot(sample_rpkm,name=name,folder=folder) # rpkm_values_stackplot
+            dag_stackplot(sample_rpkm,expressed_only=1,name=name,folder=folder) # rpkm_values_expressed_only_stackplot
+            
+            # RPKM stackplot shared
+            ##sample_rpkm_shared<-sample_rpkm[rownames(shared),]
+            ##dag_stackplot(sample_rpkm_shared,name=paste0(name,"_shared"),folder=folder) # sample_rpkm_shared_values_stackplot
+            
+            # Save some stats:
+            #lib.size <- sample_filtered_TMM$samples$lib.size*sample_filtered_TMM$samples$norm.factors
+            #y<-sample_filtered_TMM
+            #for (i in colnames(y$counts)){
+            #  #y$counts[,i]<-y$counts[,i]*y$samples[rownames(y$samples) %in% i,"lib.size"]*y$samples[rownames(y$samples) %in% i,"norm.factors"]
+            #  y$counts[,i]<-y$counts[,i]*y$samples[rownames(y$samples) %in% i,"norm.factors"]
+            #}
+            #write.table(y$counts,file=paste0(folder,name,"NormCounts.txt"))  
+              
+            mean(genes_count$shared+genes_count$unique)
+          }
+          
+          
+          if (runedgeR==1){
+            # Calculate now all the DEGs 
+            model<-dag_design_and_contrasts(data=data,contrast1=dag_contrast1,contrast2=dag_contrast2,contrast3=dag_contrast3,contrast4=dag_contrast4,folder=folder,name=name,incompatible = dag_incompatible,simple=dag_simple,complex=dag_complex) # Another option would be to create manually the design and all the desired contrasts. This works as default model to compare species(contrast1) or stade(contrast2) vs condition(contrast3) or replicate(contrast4)
+
+            if (dag_filter_contrast==1){ # Filter contrasts to retain only the ones containing a "-". I.e.: complex or (A_100-A_250)
+            # model$used<-model$used[rownames(model$used) %like% "-",]
+            # model$contrasts<-model$contrasts[rownames(model$contrasts) %like% "-",]
+            # # Leave only single species comparisons i.e. (A_100-A_250)
+            # x<-model$used
+            # for (y in rownames(model$used)){
+            #   #colnames(x[y,x[y,]==1])
+            #   #model$fgroup$sample[model$fgroup$sample %in% c(colnames(x[y,x[y,]==1])),]
+            #   #model$fgroup[model$fgroup$sample %in% c(colnames(x[y,x[y,]==1])),]$grp1
+            #   if(length(unique(as.character(model$fgroup[model$fgroup$sample %in% c(colnames(x[y,x[y,]==1])),]$grp1)))!=1){x[y,]<-0}
+            # }
+            # model$used<-x[rowSums(x)!=0,]
+            # model$contrasts<-model$contrasts[rownames(x[rowSums(x)!=0,]),]
+
+            x<-model$used
+            z<-c("0")
+            for (y in rownames(model$used)){
+              if (dag_complex==1){
+                if (dag_contrast1==1 & dag_contrast2==0){
+                  if(y %like% '.*)-'){
+                     #print(paste0(y))
+                     z<-c(z,y)
+                   }
+                } else {
+                  if(y %like% '.*-.*)-'){
+                     #print(paste0(y))
+                     z<-c(z,y)
+                  }
+                }
+              } else {
+                if (dag_contrast1==1 & dag_contrast2==0){
+                   if (!y %like% "-"){
+                    z<-c(z,y)
+                   }
+                } else {
+                  if(length(unique(as.character(model$fgroup[model$fgroup$sample %in% c(colnames(x[y,x[y,]==1])),]$grp1)))==1){
+                    #print(paste0(y))
+                    z<-c(z,y)
+                  }
+                }
+              }
+            }
+            z<-z[2:length(z)]
+            model$used<-model$used[z,]
+            model$contrasts<-model$contrasts[z,]
+
+
+            write.table(model$contrast,file=paste0(folder,"/edgeR/",name,"/",name,"_Contrasts_",dag_filter_contrast,".txt"))
+            write.table(model$used,file=paste0(folder,"/edgeR/",name,"/",name,"_Used_",dag_filter_contrast,".txt"))
+          }
+            if (dag_filter_contrast==2){ # Filter contrasts to retain only the ones containing a "_" but no "-" in the first part. I.e.: compler like (C0_100)-(L_100-R_100)
+              x<-model$used
+              z<-c("0")
+              for (y in rownames(model$used)){
+                if(y %like% '\\([a-zA-Z0-9]+_[a-zA-Z0-9]+\\)-'){
+                  z<-c(z,y)
+                }
+              }
+              z<-z[2:length(z)]
+              model$used<-model$used[z,]
+              model$contrasts<-model$contrasts[z,]
+  
+              write.table(model$contrast,file=paste0(folder,"/edgeR/",name,"/",name,"_Contrasts_",dag_filter_contrast,".txt"))
+              write.table(model$used,file=paste0(folder,"/edgeR/",name,"/",name,"_Used_",dag_filter_contrast,".txt"))
+            }
+            if (dag_filter_contrast==3){ # 3 = Filter contrasts to retain only the ones containing a "_" and one "-" in the first part. I.e.: complex like (5E_18-5E_12)-(5L_18-5L_12)
+              x<-model$used
+              z<-c("0")
+              for (y in rownames(model$used)){
+                if(y %like% '\\([a-zA-Z0-9]+_[a-zA-Z0-9]+-[a-zA-Z0-9]+_[a-zA-Z0-9]+\\)-'){
+                  z<-c(z,y)
+                }
+              }
+              z<-z[2:length(z)]
+              model$used<-model$used[z,]
+              model$contrasts<-model$contrasts[z,]
+  
+              write.table(model$contrast,file=paste0(folder,"/edgeR/",name,"/",name,"_Contrasts_",dag_filter_contrast,".txt"))
+              write.table(model$used,file=paste0(folder,"/edgeR/",name,"/",name,"_Used_",dag_filter_contrast,".txt"))
+            }
+            if (dag_filter_contrast==4){ # Option 1 + 3
+              x<-model$used
+              z<-c("0")
+              for (y in rownames(model$used)){
+                if (dag_complex==1){
+                  if (dag_contrast1==1 & dag_contrast2==0){
+                    if(y %like% '.*)-'){
+                       #print(paste0(y))
+                       z<-c(z,y)
+                     }
+                  } else {
+                    if(y %like% '.*-.*)-'){
+                       #print(paste0(y))
+                       z<-c(z,y)
+                    }
+                  }
+                } else {
+                  if (dag_contrast1==1 & dag_contrast2==0){
+                     if (!y %like% "-"){
+                      z<-c(z,y)
+                     }
+                  } else {
+                    if(length(unique(as.character(model$fgroup[model$fgroup$sample %in% c(colnames(x[y,x[y,]==1])),]$grp1)))==1){
+                      #print(paste0(y))
+                      z<-c(z,y)
+                    }
+                  }
+                }
+              }
+              z<-z[2:length(z)]
+              
+              x<-model$used
+              zz<-c("0")
+              for (y in rownames(model$used)){
+                if(y %like% '\\([a-zA-Z0-9]+_[a-zA-Z0-9]+-[a-zA-Z0-9]+_[a-zA-Z0-9]+\\)-'){
+                  zz<-c(zz,y)
+                }
+              }
+              zz<-zz[2:length(zz)]
+              
+              
+              model$used<-model$used[c(z,zz),]
+              model$contrasts<-model$contrasts[c(z,zz),]
+  
+  
+              write.table(model$contrast,file=paste0(folder,"/edgeR/",name,"/",name,"_Contrasts_",dag_filter_contrast,".txt"))
+              write.table(model$used,file=paste0(folder,"/edgeR/",name,"/",name,"_Used_",dag_filter_contrast,".txt"))
+            }
+          
+          
+           stats<-dag_DE(data=data,name=name,filter=filter,filtermin=filtermin,filterminlib=filterminlib,plot_pairs_heatmap="no",padjusted = padjusted,DEGonly=DEGonly,runedgeR=runedgeR,folder=folder,design=model$design,contrasts=model$contrasts,used=model$used,fgroup=model$fgroup,model_method=dag_model_method,already_lib_normalized=dag_already_lib_normalized)
+          }
+        }
+      }
+    }
+}
+```
+
+# Extract list of DE gene names.
+```{r}
+DE_genes <- `edgeR_QLF_all_wingbuds-8_(5L_18-5L_12)`$table %>% filter(FDR < 0.01)
+DE_gene_names <- data.frame(DE_genes$Geneid)
+write.table(DE_gene_names, file='DE_gene_names_5_3_0.01.tsv', quote=FALSE, col.names = FALSE, row.names = FALSE)
+```
+
+# GO Enrichment (Read DEGs and look for GO enrichment) (Fixed) (copied from featureCounts-output-analysis-423 and dag_geneID2GO adapted to be more generic)
+Include: Genesuniverse == Expressed genes
+```{r}
+# Create GO_annotation object
+zz<-gff_annotation[gff_annotation$type %in% "mRNA",]
+zz$Geneid<-zz$attributes
+zz$Geneid<-gsub(";Parent.*","",zz$Geneid,perl=TRUE)
+zz$Geneid<-gsub("ID=","",zz$Geneid,perl=TRUE)
+
+zz$GO<-zz$attributes
+zz$GO<-str_extract(zz$GO,"GO:.*;")
+zz$GO<-gsub(";","",zz$GO,perl=TRUE)
+
+GO_annotation<-zz[,c("Geneid","GO")]
+
+# stop("ATTENTION: NEED TO VERIFY IN COMPLIES WITH NEW ADAPTED FUNCTION: SUBGENOMES") Should work but subgenomes function is inactivated, why?
+x<-dag_geneID2GO(data=GO_annotation,column_id = "Geneid",column_go = "GO")
+geneID2GO<-x$geneID2GO
+GO2geneID<-x$GO2geneID
+geneID2GO_x<-x$geneID2GO_x
+GO2geneID_x<-x$GO2geneID_x
+# genesUniverse <- names(geneID2GO) # It is actually defined later
+tableGoGenes <- x$tableGoGenes
+tableGoGenesSplit <- x$tableGoGenesSplit
+ 
+#for (all_up_down in c("all","up","down")){
+for (all_up_down in c("all")){
+  for (prefix in unique(c(dag_complete_prefix_2,dag_prefix))){
+    for (subgenome in dag_subgenomes){
+        if (subgenome=="none" | (
+        prefix %like% "^[a-zA-Z]*_[0-9]"  | # Because if I have already splitted by subgenomes we don't need to do it again
+        (subgenome=="A" & prefix %like% "^.*_A_") |
+        (subgenome=="B" & prefix %like% "^.*_B_") |
+        (subgenome=="D" & prefix %like% "^.*_D_") )){
+
+          for (expressed_only in c("0","1")){    
+            names<-dag_folders_name(prefix=prefix,prefix2=dag_prefix2,subgenome=subgenome,filtermin=filtermin,filterminlib=filterminlib,filter_low=filter_low,padjusted=padjusted)
+          name=names$name
+          folder=names$folder
+          folderPCA=names$folderPCA
+          folderData=names$folderData
+          folderUpset=names$folderUpset
+          folderedgeR=names$folderedgeR
+          folderGO=names$folderGO
+          
+          # Load everything  
+          m<-read.table(file=paste0(folderedgeR,name,"/",name,"_Contrasts.txt"),header=T)
+          contrasts<-rownames(m)
+          #contrasts<-contrasts[23]
+          contrasts<-c("(4E_18-4E_12)","(4L_18-4L_12)","(5E_18-5E_12)","(5L_18-5L_12)")
+          
+          for (i in contrasts){
+            n<-paste0(name,"_",i)
+            temp<-readRDS(file=paste0("~/Desktop/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/edgeR/wingbuds-8/data/edgeR_QLF_all_wingbuds-8_(5L_18-5L_12).Rds"))
+            temp<-temp$table
+            
+            if (all_up_down=="all"){
+              t<-temp[temp$FDR<=0.01,]
+              name2<-paste0(n,"_all")
+            } else if (all_up_down=="up"){
+              t<-temp[temp$FDR<=0.01 & temp$logFC>0,]
+              name2<-paste0(n,"_up")
+            } else if (all_up_down=="down"){
+              t<-temp[temp$FDR<=0.01 & temp$logFC<0,]
+              name2<-paste0(n,"_down")
+            }
+            
+            if (expressed_only=="1"){
+              name2<-paste0(n,"_expressed")
+              genesUniverse <- names(geneID2GO)
+            } else {
+              genesUniverse<-temp$Geneid              
+            }
+            
+            #t<-unique(merge(temp[temp$FDR<=0.05,],functional_annotation[Simp.Gene.ID %in% temp$Geneid,c("Simp.Gene.ID","Human.Readable.Description")],by.x="Geneid",by.y="Simp.Gene.ID",all=T))
+            #t<-t[with(t,order(FDR)),]
+            
+            if (nrow(t)!=0){
+              #GOresults<-dag_GO(data=t,name=name2,folder=folderGO,slim=TRUE)
+              GOresults<-dag_GO(data=t,name=name2,folder=folderGO,geneID2GO=geneID2GO,genesUniverse=genesUniverse)
+              # assign(paste0(name2,"_GO_BP"),GOresults$allRes_BP)
+              # assign(paste0(name2,"_GO_CC"),GOresults$allRes_CC)
+              # assign(paste0(name2,"_GO_MF"),GOresults$allRes_MF)
+            }
+          }
+          }
+      }
+    }
+  }
+}
+```
+
+
+
+Read GO Enrichment results
+```{r}
+for (all_up_down in c("all","up","down")){
+  ls_BP=list()
+  ls_CC=list()
+  ls_MF=list()
+  for (prefix in c(dag_prefix)){
+    names<-dag_folders_name(prefix=prefix,prefix2=dag_prefix2,subgenome=subgenome,filtermin=filtermin,filterminlib=filterminlib,filter_low=filter_low,padjusted=padjusted)
+    name=names$name
+    folder=names$folder
+    folderPCA=names$folderPCA
+    folderData=names$folderData
+    folderUpset=names$folderUpset
+    folderedgeR=names$folderedgeR
+    folderGO=names$folderGO
+    
+    # Load everything  
+        
+    m<-read.table(file=paste0(folderedgeR,name,"/",name,"_Contrasts.txt"),header=T)
+    contrasts<-rownames(m)
+    contrasts<-contrasts[23]
+    
+    for (i in contrasts){
+      n<-paste0(name,"_",i)
+      if (file.exists(paste0(folderedgeR,"/",name,"/data/edgeR_QLF_",all_up_down,"_",n,".Rds"))){
+        temp<-readRDS(file=paste0(folderedgeR,"/",name,"/data/edgeR_QLF_",all_up_down,"_",n,".Rds"))
+        #temp<-temp$table
+        if (all_up_down=="all"){
+          t<-temp[temp$FDR<=0.01,]
+          name2<-paste0(n,"_all")
+        } else if (all_up_down=="up"){
+          t<-temp[temp$FDR<=0.01 & temp$logFC>0,]
+          name2<-paste0(n,"_up")
+        } else if (all_up_down=="down"){
+          t<-temp[temp$FDR<=0.01 & temp$logFC<0,]
+          name2<-paste0(n,"_down")
+        }
+              
+              
+        for (j in c("BP","CC","MF")){
+          if (file.exists(paste0(folderGO,"GO_data_",name2,"_",j,".Rds"))){
+            GOdata<-readRDS(file=paste0(folderGO,"GO_data_",name2,"_",j,".Rds"))
+            resultFisher<-readRDS(file=paste0(folderGO,"GO_resultFisher_",name2,"_",j,".Rds"))
+            resultKS<-readRDS(file=paste0(folderGO,"GO_resultKS_",name2,"_",j,".Rds"))
+            resultElim<-readRDS(file=paste0(folderGO,"GO_resultElim_",name2,"_",j,".Rds"))
+            resultWeight<-readRDS(file=paste0(folderGO,"GO_resultWeight_",name2,"_",j,".Rds"))
+    
+            allRes <- GenTable(GOdata, classic = resultFisher, KS = resultKS, elim=resultElim, weight = resultWeight, orderBy = "weight", ranksOf = "classic", topNodes = length(usedGO(GOdata)))
+            if (nrow(allRes)!=0){
+              # print(paste0(j," ",nrow(allRes)))
+              allRes$temp<-gsub("<","",perl=TRUE,allRes$weight)  # If not, values <1e-30 are coerced as NAs
+              allRes$temp<-as.numeric(allRes$temp)  # If not, it is treated as character and values like 1e-5 is ignored
+              allRes <- allRes[allRes$temp<0.05,]
+              allRes <- allRes[,!colnames(allRes) %in% "temp"]
+              assign(paste0(name2,"_GO_",j),allRes)
+    
+              if (nrow(allRes)!=0){        
+                allRes$Name<-name
+                allRes$Contrast<-i
+            
+                # pval <- score(resultFisher);hist(pval, 50, xlab = "p-values")
+                # pval <- score(resultKS);hist(pval, 50, xlab = "p-values")
+                # pval <- score(resultElim);hist(pval, 50, xlab = "p-values")
+                # pval <- score(resultWeight);hist(pval, 50, xlab = "p-values")
+            
+                if (j=="BP"){ls_BP[[paste0(name,"_",i)]]<-allRes}
+                if (j=="CC"){ls_CC[[paste0(name,"_",i)]]<-allRes}
+                if (j=="MF"){ls_MF[[paste0(name,"_",i)]]<-allRes}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  saveRDS(do.call(rbind.data.frame, ls_BP),file=paste0(folderGO,"GO_resume_",all_up_down,"_BP.Rds"))
+  saveRDS(do.call(rbind.data.frame, ls_CC),file=paste0(folderGO,"GO_resume_",all_up_down,"_CC.Rds"))
+  saveRDS(do.call(rbind.data.frame, ls_MF),file=paste0(folderGO,"GO_resume_",all_up_down,"_MF.Rds"))
+  write.table(do.call(rbind.data.frame, ls_BP),file=paste0(folderGO,"GO_resume_",all_up_down,"_BP.txt"),row.names=TRUE,col.names = TRUE)
+  write.table(do.call(rbind.data.frame, ls_CC),file=paste0(folderGO,"GO_resume_",all_up_down,"_CC.txt"),row.names=TRUE,col.names = TRUE)
+  write.table(do.call(rbind.data.frame, ls_MF),file=paste0(folderGO,"GO_resume_",all_up_down,"_MF.txt"),row.names=TRUE,col.names = TRUE)
+}
+```
+

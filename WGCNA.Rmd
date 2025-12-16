@@ -1,0 +1,439 @@
+# Install the package.
+```{r}
+BiocManager::install("impute")
+BiocManager::install("preprocessCore")
+BiocManager::install("BioNERO")
+
+install.packages("WGCNA")
+```
+
+# Load the package.
+```{r}
+library(WGCNA)
+library(tidyverse)
+library(ggpubr)
+library(magrittr)
+library(edgeR)
+library(gtools)
+library(data.table)
+library(topGO)
+library(Rgraphviz)
+library(doParallel)
+registerDoParallel(cores=8)
+```
+
+# Load the data, and trim away the columns that are not necessary. Eliminate as well the samples that we discarded based on the PCA.
+```{r}
+setwd("~/Desktop/PhD/Research/G.buenoi-DGE")
+count_data <- read.table("./files/subread_counts_wingbuds.txt",header=TRUE, row.names = 1) # All genes that are expressed are included in the analysis.
+#count_data <- read.table("./files/subread_counts_wingbuds_DE.txt",header=FALSE, row.names = 1) # Only DEG are included.
+count_data <- count_data[,-1:-5]
+colnames(count_data) <- c("A_4E_18_2", "A_4E_18_3", "A_4E_18_4", "A_4E_18_5", "A_4E_18_6", "A_4E_18_7", "B_4L_18_1", "B_4L_18_2", "B_4L_18_5", "B_4L_18_6", "B_4L_18_7", "C_5E_18_1", "C_5E_18_2", "C_5E_18_3", "C_5E_18_4", "C_5E_18_5", "C_5E_18_7", "D_5L_18_1", "D_5L_18_2", "D_5L_18_3", "D_5L_18_4", "D_5L_18_5", "D_5L_18_6", "W_5L_12_1", "W_5L_12_2", "W_5L_12_3", "W_5L_12_4", "W_5L_12_5", "X_4E_12_2", "X_4E_12_3", "X_4E_12_4", "X_4E_12_5", "X_4E_12_6", "X_4E_12_7", "Y_4L_12_1", "Y_4L_12_3", "Y_4L_12_5", "Y_4L_12_6", "Y_4L_12_7", "Y_4L_12_8", "Z_5E_12_1", "Z_5E_12_2", "Z_5E_12_3", "Z_5E_12_4", "Z_5E_12_5", "Z_5E_12_7")
+
+count_data <- count_data[, -c(7,14,18,19,22,27,36)]
+```
+
+# Create the metadata matrix and the DGEList element. Filter for low expression and extract normalized counts.
+```{r}
+groups <- read.table("./files/groups_WGCNA.txt", header = TRUE, row.names = 1)
+Group <- factor(paste(groups$Stage, groups$Photoperiod, sep = "_"))
+
+dge_raw <- DGEList(counts = count_data, group = Group)
+
+keep <- rowSums(cpm(dge_raw)>=5) >= 3
+dge_filtered <- dge_raw[keep,,keep.lib.sizes=FALSE]
+
+dge_filtered_TMM <- calcNormFactors(dge_filtered, method = "TMM")
+#cpm(dge_filtered) # I calculated myself the cpm values after normalization and they are correct. Extracting the output of cpm() should suffice.
+
+normalized_counts <- cpm(dge_filtered_TMM) # No log-transformation as recommended by the original author of WGCNA (https://peterlangfelder.com/2018/11/25/filtering-and-collapsing-data/)
+
+rm(dge_filtered)
+```
+
+# Transpose the table to be able to use it as input in WGCNA.
+```{r}
+normalized_counts <- t(normalized_counts)
+```
+
+# Now this table should be enough to start running WGCNA.
+```{r}
+powers = c(c(1:10), seq(from = 12, to = 30, by = 2))
+
+enableWGCNAThreads()
+WGCNAnThreads()
+enableWGCNAThreads(nThreads = 7)
+
+sft <- pickSoftThreshold(
+  normalized_counts,
+  blockSize = 1000,
+  powerVector = powers,
+  dataIsExpr = TRUE,
+  corFnc = cor,
+  networkType = "signed",
+  verbose = 10
+)
+
+rm(powers)
+
+write.table(sft$fitIndices, "./WGCNA/soft_threshold.txt", quote=FALSE, sep = "\t", row.names = FALSE)
+```
+
+# We create a new variable for the signed R2, which is a measure of the fit of the model.
+```{r}
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+
+png("./WGCNA/soft_threshold.png")
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     main = paste("Scale independence"),
+     abline(h = 0.80, col = "red") # The threshold of 0.8 I found in https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html#410_Which_modules_have_biggest_differences_across_treatment_groups
+)
+png("./WGCNA/soft_threshold.png")
+dev.off()
+
+rm(sft_df)
+
+# We select the power = 16 for all genes as it is the first to exceed the recommended threshold of 0.8 signed R2. The signed R2 plateaus after that.
+```
+
+# Run the WGCNA.
+```{r}
+# For this chunk to work, it is necessary to restart R and load ONLY the WGCNA package.
+bwnet <- blockwiseModules(normalized_counts,
+  maxBlockSize = 5000, # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = 16, # soft threshold for network construction, 16 for whole geneset, 12 for DE genes as well.
+  numericLabels = TRUE, # Let's use numbers instead of colors for module labels
+  randomSeed = 1234, # there's some randomness associated with this calculation
+  # so we should set a seed
+  minModuleSize = 30, # minimum number of genes per cluster.
+  mergeCutHeight = 0.25, # clusters closer than 0.25 (equivalent to correlation of 0.75 or higher) will be merged
+  verbose = 3
+)
+# Now load all packages again.
+```
+# We save the main WGCNA file to an object to be able to go back to it.
+```{r}
+readr::write_rds(bwnet,"./WGCNA/wgcna_results.RDS")
+bwnet <- readRDS("./WGCNA/wgcna_results.RDS")
+```
+
+# We can plot the modules in a dendogram to see the proximity between different genes.
+```{r}
+# Convert labels to colors for plotting
+mergedColors = labels2colors(bwnet$colors)
+#mergedColors
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(
+  bwnet$dendrograms[[1]],
+  mergedColors[bwnet$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05)
+
+#bwnet$colors[bwnet$blockGenes[[1]]]
+table(bwnet$colors) # How many genes cluster within each module.
+
+module_eigengenes <- bwnet$MEs
+module_eigengenes # This shows, for each WGCNA cluster of genes, the relative contribution to each sample (library).
+sum(module_eigengenes$ME0) # They add to 0, as the contribution of each sample can be positive or negative (between 1 and -1)
+```
+
+
+# Load metadata.
+```{r}
+metadata <- read.table("./files/groups_WGCNA.txt",header=TRUE, row.names = 1)
+metadata$Photoperiod <- as.factor(metadata$Photoperiod)
+#all.equal(rownames(metadata), rownames(module_eigengenes)) # Check the names of the different rows (sample names) coincide.
+```
+
+# Enter the design matrix.
+```{r}
+des_mat <- model.matrix(~metadata$Stage*metadata$Photoperiod) # This replicates the matrix used in edgeR for DGE.
+des_mat
+colnames(des_mat) <- c("(Intercept)", "4L", "5E", "5L", "18", "4L:18", "5E:18", "5L:18")
+```
+
+# Output the cluster to which each gene belongs and save it in a file for future reference.
+```{r}
+module_df <- data.frame(
+  gene_id = names(bwnet$colors),
+  colors = labels2colors(bwnet$colors),
+  module = bwnet$colors
+)
+
+write_delim(module_df,
+            file = "./WGCNA/gene_modules.txt",
+            delim = "\t")
+```
+
+```{r}
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df) # Here we can identify the modules that have more significant differences in gene expression across the different treatment comparisons.
+write_delim(stats_df,
+            file = "./WGCNA/stats_modules.txt",
+            delim = "\t")
+```
+
+
+
+# Calculate eigengene (median gene value for each module) and plot them in a heatmap to see how they are associated with each treatment.
+```{r}
+# Get Module Eigengenes per cluster
+MEs0_whole <- moduleEigengenes(normalized_counts, mergedColors, excludeGrey = TRUE)#$eigengenes
+MEs0 <- moduleEigengenes(normalized_counts, mergedColors, excludeGrey = TRUE)$eigengenes
+variation_explained <- moduleEigengenes(normalized_counts, mergedColors, excludeGrey = TRUE)$varExplained
+# We see it is extremely low (0.13) for the grey cluster. Hence we can discard it. See "excludeGrey = TRUE" above)
+
+# Reorder modules so similar modules are next to each other
+MEs0 <- orderMEs(MEs0)
+module_order = names(MEs0) %>% gsub("ME","", .)
+
+# Add treatment names
+MEs0$treatment = row.names(MEs0)
+
+# tidy & plot data
+mME = MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order)
+  )
+
+mME$name <- gsub('grey','0', mME$name)
+mME$name <- gsub('turquoise','1', mME$name)
+mME$name <- gsub('blue','2', mME$name)
+mME$name <- gsub('brown','3', mME$name)
+mME$name <- gsub('yellow','4', mME$name)
+mME$name <- gsub('green','5', mME$name)
+mME$name <- gsub('red','6', mME$name)
+mME$name <- gsub('black','7', mME$name)
+mME$name <- gsub('pink','8', mME$name)
+mME$name <- gsub('magenta','9', mME$name)
+mME$name <- gsub('purple','10', mME$name)
+mME$name <- gsub('54','11', mME$name)
+mME$name <- gsub('tan','12', mME$name)
+mME$name <- gsub('salmon','13', mME$name)
+mME$name <- gsub('cyan','14', mME$name)
+
+mME$treatment <- gsub('A_4E','i4E', mME$treatment)
+mME$treatment <- gsub('X_4E','i4E', mME$treatment)
+mME$treatment <- gsub('B_4L','i4L', mME$treatment)
+mME$treatment <- gsub('Y_4L','i4L', mME$treatment)
+mME$treatment <- gsub('C_5E','i5E', mME$treatment)
+mME$treatment <- gsub('Z_5E','i5E', mME$treatment)
+mME$treatment <- gsub('D_5L','i5L', mME$treatment)
+mME$treatment <- gsub('W_5L','i5L', mME$treatment)
+
+# For display reasons only, create a new column with the "values" rounded to 2 decimals.
+mME$rounded <-round(mME$value,2)
+mME$name = factor(mME$name, levels = c("14", "13", "12", "11", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1", "0"))
+mME[with(mME, order("treatment")),]
+mME$treatment = factor(mME$treatment, levels = c("i4E_12_2", "i4E_12_3", "i4E_12_4", "i4E_12_5", "i4E_12_6", "i4E_12_7", "i4L_12_1", "i4L_12_5", "i4L_12_6", "i4L_12_7", "i4L_12_8", "i5E_12_1", "i5E_12_2", "i5E_12_3", "i5E_12_4", "i5E_12_5", "i5E_12_7", "i5L_12_1", "i5L_12_2", "i5L_12_3", "i5L_12_5", "i4E_18_2", "i4E_18_3", "i4E_18_4", "i4E_18_5", "i4E_18_6", "i4E_18_7", "i4L_18_2", "i4L_18_5", "i4L_18_6", "i4L_18_7", "i5E_18_1", "i5E_18_2", "i5E_18_4", "i5E_18_5", "i5E_18_7", "i5L_18_3", "i5L_18_4", "i5L_18_6"))
+mME[with(mME, order("treatment")),]
+mME_mod <- with(mME, mME[order(treatment, name), ]) # We reorder the data based on treatment first, then name (number of the module). I manually checked this and the resulting plot with geom_tile is properly displayed :)
+
+plot <- mME_mod %>% ggplot(., aes(x=treatment, y=name, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  theme(plot.title=element_text(size = 15, face = "bold"),
+        axis.text.x = element_text(angle=90, size=8, face = "bold"),
+        axis.text.y=element_text(size=8, face = "bold"),
+        axis.title = element_text(size = 12, face="bold"),
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        legend.text = element_text(size=10)) +
+  labs(y = "Module Number", x = "Library", fill="corr") +
+  geom_text(aes(label = rounded), size = 2, angle=90) +
+  guides(fill = guide_colorbar(barwidth = 0.5, barheight = 10))
+
+plot
+
+ggsave("./WGCNA/Module-trait.png", dpi = 1000)
+ggsave("./WGCNA/Module-trait.pdf", dpi = 1000)
+```
+
+
+# Now we can explore specific modules that we find interesting. 
+# Interesting clusters are somewhat arbitrarily determined, and might include those that have substantial differnece in the correlation of the eigengene in a given stage across photoperiods, or significant variation across time.
+# Looking at the module-trait relationships we got, I would say the interesting are:
+# Module 2, Module 5, Module 8 for being very different in i5L across photoperiods.
+# Module 11, Module 14 for being different in i4L across photoperiods.
+# Module 10 for being tightly positively correlated in i5E, where we don't see any DE.
+```{r}
+prefix_output="topGO-all"
+module_number="14"
+
+
+
+candidate_genes <- module_df %>% filter(module == module_number)
+candidate_genes <- data.frame(candidate_genes$gene_id)
+colnames(candidate_genes) <- "geneid"
+
+geneNames_all <- read.table("geneNames_annotated_genes.tsv", header = F)
+colnames(geneNames_all) <- "geneid"
+geneNames_all <- as.character(geneNames_all$geneid)
+
+geneList_all <- factor(as.integer(geneNames_all %in% candidate_genes$geneid))
+table(geneList_all)
+names(geneList_all) <- geneNames_all
+
+geneID2GO_test <- readMappings(file="geneid2go_modified.map", sep = "\t")
+
+topGOdata_BP_all <- new("topGOdata",
+               ontology="BP",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_CC_all <- new("topGOdata",
+               ontology="CC",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_MF_all <- new("topGOdata",
+               ontology="MF",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+resultFisher_BP_all <- runTest(topGOdata_BP_all, algorithm = "classic", statistic = "fisher")
+resultKS_BP_all <- runTest(topGOdata_BP_all,algorithm="classic",statistic="ks")
+resultKS.elim_BP_all <- runTest(topGOdata_BP_all,algorithm="elim",statistic="ks")
+
+resultFisher_CC_all <- runTest(topGOdata_CC_all, algorithm = "classic", statistic = "fisher")
+resultKS_CC_all <- runTest(topGOdata_CC_all,algorithm="classic",statistic="ks")
+resultKS.elim_CC_all <- runTest(topGOdata_CC_all,algorithm="elim",statistic="ks")
+
+resultFisher_MF_all <- runTest(topGOdata_MF_all, algorithm = "classic", statistic = "fisher")
+resultKS_MF_all <- runTest(topGOdata_MF_all,algorithm="classic",statistic="ks")
+resultKS.elim_MF_all <- runTest(topGOdata_MF_all,algorithm="elim",statistic="ks")
+
+allRes_BP_all <- GenTable(topGOdata_BP_all, classicFisher = resultFisher_BP_all, classicKS = resultKS_BP_all, elimKS = resultKS.elim_BP_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_BP_all)))
+
+allRes_CC_all <- GenTable(topGOdata_CC_all, classicFisher = resultFisher_CC_all, classicKS = resultKS_CC_all, elimKS = resultKS.elim_CC_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_CC_all)))
+
+allRes_MF_all <- GenTable(topGOdata_MF_all, classicFisher = resultFisher_MF_all, classicKS = resultKS_MF_all, elimKS = resultKS.elim_MF_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_MF_all)))
+
+write.table(allRes_BP_all, file = c(paste0("./WGCNA/",prefix_output,"_BP_module_",module_number,"_results.txt")), sep = "\t")
+write.table(allRes_CC_all, file = c(paste0("./WGCNA/",prefix_output,"_CC_module_",module_number,"_results.txt")), sep = "\t")
+write.table(allRes_MF_all, file = c(paste0("./WGCNA/",prefix_output,"_MF_module_",module_number,"_results.txt")), sep = "\t")
+```
+
+
+#### PLOT FOR SPECIFIC MODULES ####
+
+```{r}
+#First step is to extract the name of the genes that belong to one cluster of interest.
+gene_module <- read.table("./WGCNA/gene_modules.txt", header = TRUE)
+genes_ME2 <- gene_module[gene_module$module == "8", ]
+genes_ME2 <- genes_ME2$gene_id
+
+# Now we filter the "normalized_counts" element (see above in the script), and retain ONLY the rows for the genes belonging to the module of interest.
+cpm_ME2 <- data.frame(normalized_counts[rownames(normalized_counts) %in% genes_ME2,])
+
+cpm_ME2 <- t(cpm_ME2)
+i4E_18 <- cpm_ME2[1:6,]
+i4L_18 <- cpm_ME2[7:10,]
+i5E_18 <- cpm_ME2[11:15,]
+i5L_18 <- cpm_ME2[16:18,]
+i4E_12 <- cpm_ME2[23:28,]
+i4L_12 <- cpm_ME2[29:33,]
+i5E_12 <- cpm_ME2[34:39,]
+i5L_12 <- cpm_ME2[19:22,]
+
+i4E_18_means <- data.frame(colMeans(i4E_18))
+i4L_18_means <- data.frame(colMeans(i4L_18))
+i5E_18_means <- data.frame(colMeans(i5E_18))
+i5L_18_means <- data.frame(colMeans(i5L_18))
+i4E_12_means <- data.frame(colMeans(i4E_12))
+i4L_12_means <- data.frame(colMeans(i4L_12))
+i5E_12_means <- data.frame(colMeans(i5E_12))
+i5L_12_means <- data.frame(colMeans(i5L_12))
+
+means_18 <- cbind(i4E_18_means, i4L_18_means, i5E_18_means, i5L_18_means)
+means_12 <- cbind(i4E_12_means, i4L_12_means, i5E_12_means, i5L_12_means)
+colnames(means_18) <- c("i4E","i4L","i5E","i5L")
+colnames(means_12) <- c("i4E","i4L","i5E","i5L")
+
+means_18$Max <- pmax(means_18$i4E, means_18$i4L, means_18$i5E, means_18$i5L) # Find max of all time-points
+means_12$Max <- pmax(means_12$i4E, means_12$i4L, means_12$i5E, means_12$i5L) # Find max of all time-points
+
+means_18$i4E <- means_18$i4E / means_18$Max
+means_18$i4L <- means_18$i4L / means_18$Max
+means_18$i5E <- means_18$i5E / means_18$Max
+means_18$i5L <- means_18$i5L / means_18$Max
+means_12$i4E <- means_12$i4E / means_12$Max
+means_12$i4L <- means_12$i4L / means_12$Max
+means_12$i5E <- means_12$i5E / means_12$Max
+means_12$i5L <- means_12$i5L / means_12$Max
+
+means_18 <- data.frame(means_18[,1:4])
+means_12 <- data.frame(means_12[,1:4])
+
+means_18 <- t(means_18)
+means_12 <- t(means_12)
+groups <- c("i4E", "i4L", "i5E", "i5L")
+
+means_18 <- data.table(cbind(groups, means_18))
+#means_18 <- data.table(means_18[,1:100])
+means_12 <- data.table(cbind(groups, means_12))
+#means_12 <- data.table(means_12[,1:100])
+
+means_18_melt <- melt.data.table(means_18, id.vars = "groups")
+means_18_melt <- data.frame(means_18_melt)
+means_18_melt = subset(means_18_melt, select = -c(variable))
+means_18_melt$value <- as.numeric(means_18_melt$value)
+means_18_melt$photoperiod <- as.factor("18L:6D")
+means_12_melt <- melt.data.table(means_12, id.vars = "groups")
+means_12_melt <- data.frame(means_12_melt)
+means_12_melt = subset(means_12_melt, select = -c(variable))
+means_12_melt$value <- as.numeric(means_12_melt$value)
+means_12_melt$photoperiod <- as.factor("12L:12D")
+
+means_melt <- rbind(means_12_melt, means_18_melt)
+
+plot <- ggplot(means_melt, aes(x = groups, y = value, fill = photoperiod)) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size=25),
+        axis.text.x = element_text(size=25),
+        axis.title = element_text(size = 25, face="bold"),
+        legend.title = element_blank()) +
+  geom_boxplot(notch=TRUE, outlier.alpha = 0.25) +
+  #geom_point(position = position_jitterdodge(), alpha = 0.2, size = 0.25) + # Add points for each gene.
+  scale_fill_manual(values = c("lightblue", "orange")) +
+  xlab("Developmental stage") + ylab("Fraction max")
+
+plot
+
+ggsave("./WGCNA/ME8.pdf", plot = plot, dpi = 1000, height = 5, width = 7)
+ggsave("./WGCNA/ME8.png", plot = plot, dpi = 1000, height = 5, width = 7)
+```
+
+

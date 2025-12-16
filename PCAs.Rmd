@@ -1,0 +1,103 @@
+# INSTALL REQUIRED PACKAGES
+```{r}
+install.packages("vegan")
+```
+
+# LOAD PACKAGES
+```{r}
+library(edgeR)
+library(vegan)
+library(tidyverse)
+library(ggalt)
+```
+
+# Set directory
+```{r}
+setwd("~/Desktop/PhD/Research/G.buenoi-DGE")
+```
+
+# Load the count data (subread counts), and filter appropriately.
+```{r}
+count_data <- read.table("./files/subread_counts_wingbuds.txt",header=TRUE, row.names = 1) # All genes that are expressed are included in the analysis.
+count_data <- count_data[,-1:-5]
+colnames(count_data) <- c("A_4E_18_2", "A_4E_18_3", "A_4E_18_4", "A_4E_18_5", "A_4E_18_6", "A_4E_18_7", "B_4L_18_1", "B_4L_18_2", "B_4L_18_5", "B_4L_18_6", "B_4L_18_7", "C_5E_18_1", "C_5E_18_2", "C_5E_18_3", "C_5E_18_4", "C_5E_18_5", "C_5E_18_7", "D_5L_18_1", "D_5L_18_2", "D_5L_18_3", "D_5L_18_4", "D_5L_18_5", "D_5L_18_6", "W_5L_12_1", "W_5L_12_2", "W_5L_12_3", "W_5L_12_4", "W_5L_12_5", "X_4E_12_2", "X_4E_12_3", "X_4E_12_4", "X_4E_12_5", "X_4E_12_6", "X_4E_12_7", "Y_4L_12_1", "Y_4L_12_3", "Y_4L_12_5", "Y_4L_12_6", "Y_4L_12_7", "Y_4L_12_8", "Z_5E_12_1", "Z_5E_12_2", "Z_5E_12_3", "Z_5E_12_4", "Z_5E_12_5", "Z_5E_12_7")
+
+
+### To plot only the samples belonging to a specific stage:
+
+#count_data <- count_data[, -c(7:28, 35:46)] # Instar 4-Early
+#count_data <- count_data[, -c(1:6, 12:34, 41:46)] # Instar 4-Late
+#count_data <- count_data[, -c(1:11, 18:40)] # Instar 5-Early
+#count_data <- count_data[, -c(1:17, 29:46)] # Instar 5-Late
+
+count_data <- count_data[, -c(7,14,18,19,22,27,36)] # Remove all samples that don't cluster properly.
+```
+
+# Normalize data with same criteria as in David's script.
+```{r}
+groups <- read.table("./files/groups_WGCNA.txt", header = TRUE, row.names = 1)
+#groups <- read.table("./files/groups_PCA.txt", header = TRUE, row.names = 1)
+
+### To plot only the samples belonging to a specific stage:
+#groups <- groups[-c(7:28, 35:46),] # Instar 4-Early
+#groups <- groups[-c(1:6, 12:34, 41:46),] # Instar 4-Late
+#groups <- groups[-c(1:11, 18:40),] # Instar 5-Early
+#groups <- groups[-c(1:17, 29:46),] # Instar 5-Late
+
+Group <- factor(paste(groups$Stage, groups$Photoperiod, sep = "_"))
+
+dge_raw <- DGEList(counts = count_data, group = Group)
+
+keep <- rowSums(cpm(dge_raw)>=5) >= 3
+dge_filtered <- dge_raw[keep,keep.lib.sizes=FALSE]
+
+dge_filtered_TMM <- calcNormFactors(dge_filtered, method = "TMM")
+
+normalized_counts <- cpm(dge_filtered_TMM, log=TRUE) #Log-2 transformation is common for PCA purposes.
+normalized_counts <- t(normalized_counts)
+```
+
+# PCA with the normalized data for all genes.
+```{r}
+pca <- prcomp(normalized_counts[, -c(7362:7363)])
+
+#mds<-plotMDS.DGEList(dge_filtered_TMM, method="logFC") #This plots the PCA as per edgeR, and it matches. But it will not be applicable to the AS data so I discard it as a viable method. Just a sanity check :)
+
+pc_scores <- pca$x
+pc_eigenvalues <- pca$sdev^2
+pc_eigenvalues_prop <- pc_eigenvalues/(sum(pc_eigenvalues))
+
+plot(x = seq(1:length(pc_eigenvalues_prop)), y = pc_eigenvalues_prop, type = "o", xlab = "Principal Component", ylab = "Variance")
+
+
+pc_scores <- pc_scores %>% 
+  # convert to a tibble retaining the sample names as a new column
+  as_tibble(rownames = "sample")
+
+# print the result
+pc_scores <- cbind(pc_scores, groups)
+pc_scores$Photoperiod <- as.factor(pc_scores$Photoperiod)
+
+pc_scores %>% 
+  # create the plot
+  ggplot(aes(x = PC1, y = PC2, colour = Photoperiod)) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text=element_text(size=20),
+        axis.title = element_text(size = 25, face="bold"),
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_text(size=12,face="bold"),
+        legend.text = element_text(size=10)) +
+  geom_point(aes(shape = Stage), size=6) +
+  scale_shape_manual(values = c(16,15,18,17)) +
+  labs(x = "PC1 (47.66%)", y = "PC2 (22.73%)") +
+  geom_hline(yintercept=0, linetype="dashed", color="grey", size=0.5) +
+  geom_vline(xintercept=0, linetype="dashed", color="grey", size=0.5) +
+  #ggtitle("Instar 5 - Late") + theme(plot.title = element_text(size = 18, face = "bold"))
+  geom_encircle(aes(group=Stage), color="black", linetype="dashed")
+
+ggsave("./PCAs/PCA_wingbuds_filtered_libs.pdf", dpi = 1000, width = 7, height = 5)
+ggsave("./PCAs/PCA_wingbuds_filtered_libs.png", dpi = 1000, width = 7, height = 5)
+```
+
+

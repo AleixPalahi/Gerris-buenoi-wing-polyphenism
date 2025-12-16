@@ -1,0 +1,111 @@
+Set working directory.
+```{r}
+setwd("~/Library/CloudStorage/OneDrive-Uppsalauniversitet/PhD/Research/G.buenoi-DGE")
+```
+
+
+Load required packages.
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(emmeans)
+```
+
+
+Load data.
+```{r}
+data <- read_excel("./Morphology/wing_muscles.xlsx")
+data[data == "NA"] <- NA
+clean_data <- na.omit(data)
+data$Treatment <- as.factor(data$Treatment)
+data$Height <- as.numeric(data$Height)
+data$Width <- as.numeric(data$Width)
+```
+
+
+Run stats (ANOVA and t-tests).
+```{r}
+anova_height <- aov(Height ~ Treatment + Error(Sample/Treatment), data = clean_data)
+summary(anova_height) # df = 2, SumSq = 49854, MeanSq = 24927, F = 0.84, p = 0.0152
+
+anova_width <- aov(Width ~ Treatment + Error(Sample/Treatment), data = clean_data)
+summary(anova_width) # df = 2, SumSq = 1634, MeanSq = 817.1, F = 1.053, p = 0.415
+```
+
+
+Posterior EMmeans tests to find significant differences between treatment pairs.
+```{r}
+emmeans_height <- emmeans(anova_height, pairwise ~ Treatment)
+print(emmeans_height)
+#LW - SW -> p = 0.0173
+#LW - yki -> p = 0.0389
+#SW - yki -> p = 0.5068
+
+emmeans_width <- emmeans(anova_width, pairwise ~ Treatment)
+print(emmeans_width)
+```
+
+
+Check for differences between groups!
+```{r}
+clean_data_LW_SW <- subset(clean_data, Treatment %in% c("SW", "LW"))
+
+anova_height <- aov(Height ~ Treatment + Error(Sample/Treatment), data = clean_data_LW_SW)
+summary(anova_height)
+# df=1, F=23.55, p = 0.0167
+
+anova_height <- aov(Width ~ Treatment + Error(Sample/Treatment), data = clean_data_LW_SW)
+summary(anova_height)
+# df=1, F=1.315, p = 0.335
+
+
+clean_data_LW_yki <- subset(clean_data, Treatment %in% c("yki", "LW"))
+
+anova_height <- aov(Height ~ Treatment + Error(Sample/Treatment), data = clean_data_LW_yki)
+summary(anova_height)
+# df=1, F=12.56. p=0.0239
+
+clean_data_SW_yki <- subset(clean_data, Treatment %in% c("yki", "SW"))
+
+anova_height <- aov(Height ~ Treatment + Error(Sample/Treatment), data = clean_data_SW_yki)
+summary(anova_height)
+# df=1, F=1.139, p=0.364
+```
+
+
+
+Plot results.
+```{r}
+clean_data$Treatment <- as.factor(clean_data$Treatment)
+clean_data$Height <- as.numeric(clean_data$Height)
+clean_data$Width <- as.numeric(clean_data$Width)
+
+plot <- ggplot(clean_data) +
+  aes(x = Treatment, y = Height, colour = Treatment, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + geom_point(position = position_jitter(width = 0.2), size = 3, shape = 1) +
+  theme_light() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 15, face = "bold"),
+        axis.title.y = element_text(size = 15, face = "bold"),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  scale_fill_manual(values = c("#add8e6", "#ffa500", "grey")) +
+  scale_color_manual(values = c("black", "black", "black")) +
+  ylim(150, 450) +
+  labs(y = expression("Muscle height (um)")) +
+  ggsignif::geom_signif(annotations ="*", y_position = c(380), xmin = c(1), xmax =c(2), textsize = 8) +
+  ggsignif::geom_signif(annotations ="*", y_position = c(420), xmin = c(1), xmax =c(3), textsize = 8)
+
+plot
+```
+
+
+Save the plots.
+```{r}
+ggsave("./Morphology/wing_height.png", width = 4, height = 3, dpi = 600)
+ggsave("./Morphology/wing_height.pdf", width = 4, height = 3, dpi = 600)
+```
+

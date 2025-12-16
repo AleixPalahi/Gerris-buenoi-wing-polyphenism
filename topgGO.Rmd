@@ -1,0 +1,416 @@
+
+```{r}
+load_data_only=1 # 1=Yes -> If I run the chunks only data will be loaded but not unnecessary calculations
+print_onscreen=0 # 0=No -> If I just want to print all graphs in a save file BUT NOT 'onscreen'. This should significantly improve speed.
+```
+
+
+##### LOAD PACKAGES
+```{r}
+library(topGO)
+library(Rgraphviz)
+library(KEGGREST)
+library(tidyverse)
+library(forcats)
+```
+
+#### How to generate geneid2go.map
+In UPPMAX I generate the geneID2GO.map file with the following commands:
+awk '$9 ~ "Ontology_term" {x=$9;gsub(/.*Ontology_term=/,"",x);gsub(/;.*/,"",x);y=$9;gsub(/;.*/,"",y);gsub(/ID=/,"",y);n=split(x,a,",");for (i = 0; i++ < n;){print y,a[i]}}' final_files/genome.genes.flybasewithcurated.gff3 > trial2.map
+
+sed -e 's/ /\t/g' trial2.map > geneid2go.map
+
+rm trial2.map
+
+
+#### PREFIXES
+```{r}
+prefix_output="5L_18-5L_12" #Pair-wise comparison
+```
+
+
+###### LOAD NECESSARY FILES ######
+
+# Load the candidate genes. These are the DEG at 5L between photoperiods.
+```{r}
+#The candidate genes are those that are differentially expressed for a given treatment.
+
+#"diffExpGenes_5L_18-5l_12-filtered.tsv" is created by outputting the names of the element t from the DFE script to a table and eliminating the first column and " with awk.
+#write.table(t$Geneid, file = "diffExpGenes_5L_18-5L_12.tsv")
+
+candidate_genes <- read.table("diffExpGenes_5L_18-5L_12-filtered.tsv", header = F)
+colnames(candidate_genes) <- "geneid"
+candidate_genes <- as.character(candidate_genes$geneid)
+```
+
+# Create the gene universes. Here we have different options. The gene universe can include all annotated genes, only the differentially expressed ones, or a selection of genes of interest.
+```{r}
+# For the first option:
+# "geneNames_annotated_genes.tsv" is invariable for all tests, it includes the list of the genes that are annotated with at least 1 GOterm, and " eliminated.
+
+# For the second one, we can create the list of names for the gene universe as follows:
+#write.table(temp$Geneid, file = "geneNames-5L_18-5L_12.tsv")
+# Then the following awk command can be used to filter it: awk '{print $2}' geneNames-5L_18-5L_12.tsv > geneNames-5L_18-5L_12_modified.tsv
+# And in BBEdit we eliminate all " marks.
+
+# For the third option, we have a file with the list of interesting GOTerms, and we need to find out which genes correspond to such GOTerms.
+target_GOTerms <- read.table("list_interesting_GOTerms.txt", header = T)
+
+geneID2GO_test <- readMappings(file="geneid2go_modified.map", sep = "\t") # We load the equivalence between geneID and GO-Terms.
+GO2geneID_test <- inverseList(geneID2GO_test)
+GO2geneID_test_filtered <- GO2geneID_test[names(GO2geneID_test)%in%target_GOTerms$GOID] # Retain GOTerms of interest.
+geneID2GO_test_filtered <- inverseList(GO2geneID_test_filtered)
+```
+
+
+```{r}
+# Now we load all the gene universes.
+geneNames_all <- read.table("geneNames_annotated_genes.tsv", header = F)
+geneNames_expressed <- read.table("geneNames-5L_18-5L_12_modified.tsv", header = F)
+geneNames_interest <- data.frame(names(geneID2GO_test_filtered))
+colnames(geneNames_all) <- "geneid"
+colnames(geneNames_expressed) <- "geneid"
+colnames(geneNames_interest) <- "geneid"
+geneNames_all <- as.character(geneNames_all$geneid)
+geneNames_expressed <- as.character(geneNames_expressed$geneid)
+geneNames_interest <- as.character(geneNames_interest$geneid)
+
+geneList_all <- factor(as.integer(geneNames_all %in% candidate_genes))
+names(geneList_all) <- geneNames_all
+geneList_expressed <- factor(as.integer(geneNames_expressed %in% candidate_genes))
+names(geneList_expressed) <- geneNames_expressed
+geneList_interest <- factor(as.integer(geneNames_interest %in% candidate_genes))
+names(geneList_interest) <- geneNames_interest 
+# The gene universe cannot be the DE genes only, as it coincides with the candidate gene list and makes the topGO analysis fail.
+
+# Now we run the topGO analyses, with gene universe being 
+topGOdata_BP_all <- new("topGOdata",
+               ontology="BP",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_BP_expressed <- new("topGOdata",
+               ontology="BP",
+               allGenes=geneList_expressed,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_BP_interest <- new("topGOdata",
+               ontology="BP",
+               allGenes=geneList_interest,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_CC_all <- new("topGOdata",
+               ontology="CC",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_CC_expressed <- new("topGOdata",
+               ontology="CC",
+               allGenes=geneList_expressed,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_CC_interest <- new("topGOdata",
+               ontology="CC",
+               allGenes=geneList_interest,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_MF_all <- new("topGOdata",
+               ontology="MF",
+               allGenes=geneList_all,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_MF_expressed <- new("topGOdata",
+               ontology="MF",
+               allGenes=geneList_expressed,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+
+topGOdata_MF_interest <- new("topGOdata",
+               ontology="MF",
+               allGenes=geneList_interest,
+               annot=annFUN.gene2GO,
+               gene2GO=geneID2GO_test,
+               nodeSize=1)
+```
+
+
+#### RUN THE ANALYSES
+```{r}
+resultFisher_BP_all <- runTest(topGOdata_BP_all, algorithm = "classic", statistic = "fisher")
+resultKS_BP_all <- runTest(topGOdata_BP_all,algorithm="classic",statistic="ks")
+resultKS.elim_BP_all <- runTest(topGOdata_BP_all,algorithm="elim",statistic="ks")
+
+resultFisher_BP_expressed <- runTest(topGOdata_BP_expressed, algorithm = "classic", statistic = "fisher")
+resultKS_BP_expressed <- runTest(topGOdata_BP_expressed,algorithm="classic",statistic="ks")
+resultKS.elim_BP_expressed <- runTest(topGOdata_BP_expressed,algorithm="elim",statistic="ks")
+
+resultFisher_BP_interest <- runTest(topGOdata_BP_interest, algorithm = "classic", statistic = "fisher")
+resultKS_BP_interest <- runTest(topGOdata_BP_interest,algorithm="classic",statistic="ks")
+resultKS.elim_BP_interest <- runTest(topGOdata_BP_interest,algorithm="elim",statistic="ks")
+
+resultFisher_CC_all <- runTest(topGOdata_CC_all, algorithm = "classic", statistic = "fisher")
+resultKS_CC_all <- runTest(topGOdata_CC_all,algorithm="classic",statistic="ks")
+resultKS.elim_CC_all <- runTest(topGOdata_CC_all,algorithm="elim",statistic="ks")
+
+resultFisher_CC_expressed <- runTest(topGOdata_CC_expressed, algorithm = "classic", statistic = "fisher")
+resultKS_CC_expressed <- runTest(topGOdata_CC_expressed,algorithm="classic",statistic="ks")
+resultKS.elim_CC_expressed <- runTest(topGOdata_CC_expressed,algorithm="elim",statistic="ks")
+
+resultFisher_CC_interest <- runTest(topGOdata_CC_interest, algorithm = "classic", statistic = "fisher")
+resultKS_CC_interest <- runTest(topGOdata_CC_interest,algorithm="classic",statistic="ks")
+resultKS.elim_CC_interest <- runTest(topGOdata_CC_interest,algorithm="elim",statistic="ks")
+
+resultFisher_MF_all <- runTest(topGOdata_MF_all, algorithm = "classic", statistic = "fisher")
+resultKS_MF_all <- runTest(topGOdata_MF_all,algorithm="classic",statistic="ks")
+resultKS.elim_MF_all <- runTest(topGOdata_MF_all,algorithm="elim",statistic="ks")
+
+resultFisher_MF_expressed <- runTest(topGOdata_MF_expressed, algorithm = "classic", statistic = "fisher")
+resultKS_MF_expressed <- runTest(topGOdata_MF_expressed,algorithm="classic",statistic="ks")
+resultKS.elim_MF_expressed <- runTest(topGOdata_MF_expressed,algorithm="elim",statistic="ks")
+
+resultFisher_MF_interest <- runTest(topGOdata_MF_interest, algorithm = "classic", statistic = "fisher")
+resultKS_MF_interest <- runTest(topGOdata_MF_interest,algorithm="classic",statistic="ks")
+resultKS.elim_MF_interest <- runTest(topGOdata_MF_interest,algorithm="elim",statistic="ks")
+
+# resultFisher_BP_all <- runTest(topGOdata_BP_all, algorithm = "classic", statistic = "fisher")
+# 
+# resultFisher_MF_all <- runTest(topGOdata_MF_all, algorithm = "classic", statistic = "fisher")
+```
+
+
+#### CREATE SUMMARY TABLES
+```{r}
+#For it to include all GO terms in the result tables, the topNodes values must be changed to the number of lines in the results... score lines.
+allRes_BP_all <- GenTable(topGOdata_BP_all, classicFisher = resultFisher_BP_all, classicKS = resultKS_BP_all, elimKS = resultKS.elim_BP_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_BP_all)))
+allRes_BP_expressed <- GenTable(topGOdata_BP_expressed, classicFisher = resultFisher_BP_expressed, classicKS = resultKS_BP_expressed, elimKS = resultKS.elim_BP_expressed, orderBy = "classicFisher", topNodes = length(score(resultFisher_BP_expressed)))
+allRes_BP_interest <- GenTable(topGOdata_BP_interest, classicFisher = resultFisher_BP_interest, classicKS = resultKS_BP_interest, elimKS = resultKS.elim_BP_interest, orderBy = "classicFisher", topNodes = length(score(resultFisher_BP_interest)))
+
+allRes_CC_all <- GenTable(topGOdata_CC_all, classicFisher = resultFisher_CC_all, classicKS = resultKS_CC_all, elimKS = resultKS.elim_CC_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_CC_all)))
+allRes_CC_expressed <- GenTable(topGOdata_CC_expressed, classicFisher = resultFisher_CC_expressed, classicKS = resultKS_CC_expressed, elimKS = resultKS.elim_CC_expressed, orderBy = "classicFisher", topNodes = length(score(resultFisher_CC_expressed)))
+allRes_CC_interest <- GenTable(topGOdata_CC_interest, classicFisher = resultFisher_CC_interest, classicKS = resultKS_CC_interest, elimKS = resultKS.elim_CC_interest, orderBy = "classicFisher", topNodes = length(score(resultFisher_CC_interest)))
+
+allRes_MF_all <- GenTable(topGOdata_MF_all, classicFisher = resultFisher_MF_all, classicKS = resultKS_MF_all, elimKS = resultKS.elim_MF_all, orderBy = "classicFisher", topNodes = length(score(resultFisher_MF_all)))
+allRes_MF_expressed <- GenTable(topGOdata_MF_expressed, classicFisher = resultFisher_MF_expressed, classicKS = resultKS_MF_expressed, elimKS = resultKS.elim_MF_expressed, orderBy = "classicFisher", topNodes = length(score(resultFisher_MF_expressed)))
+allRes_MF_interest <- GenTable(topGOdata_MF_interest, classicFisher = resultFisher_MF_interest, classicKS = resultKS_MF_interest, elimKS = resultKS.elim_MF_interest, orderBy = "classicFisher", topNodes = length(score(resultFisher_MF_interest)))
+```
+
+
+#### OUTPUT SUMMARY TABLES
+```{r}
+write.table(allRes_BP_all, file = c(paste0(prefix_output,"_BP_all_results.txt")), sep = "\t")
+write.table(allRes_BP_expressed, file = c(paste0(prefix_output,"_BP_expressed_results.txt")), sep = "\t")
+write.table(allRes_BP_interest, file = c(paste0(prefix_output,"_BP_interest_results.txt")), sep = "\t")
+
+write.table(allRes_CC_all, file = c(paste0(prefix_output,"_CC_all_results.txt")), sep = "\t")
+write.table(allRes_CC_expressed, file = c(paste0(prefix_output,"_CC_expressed_results.txt")), sep = "\t")
+write.table(allRes_BP_interest, file = c(paste0(prefix_output,"_BP_interest_results.txt")), sep = "\t")
+
+write.table(allRes_MF_all, file = c(paste0(prefix_output,"_MF_all_results.txt")), sep = "\t")
+write.table(allRes_MF_expressed, file = c(paste0(prefix_output,"_MF_expressed_results.txt")), sep = "\t")
+write.table(allRes_BP_interest, file = c(paste0(prefix_output,"_BP_interest_results.txt")), sep = "\t")
+```
+
+
+#### CREATE HIERARCHICAL PLOTS
+```{r}
+sigOfNodes_BP <- showSigOfNodes(topGOdata_BP_all,score(resultFisher_BP_all),firstSigNodes=10,useInfo='all')
+printGraph(topGOdata_BP_all, resultFisher_BP_all, firstSigNodes = 10, fn.prefix = c(paste0(prefix_output,"_BP")), useInfo = 'all', pdfSW = TRUE)
+sigOfNodes_CC <- showSigOfNodes(topGOdata_CC_all,score(resultFisher_CC_all),firstSigNodes=10,useInfo='all')
+printGraph(topGOdata_CC_all, resultFisher_CC_all, firstSigNodes = 10, fn.prefix = c(paste0(prefix_output,"_CC")), useInfo = 'all', pdfSW = TRUE)
+sigOfNodes_MF <- showSigOfNodes(topGOdata_MF_all,score(resultFisher_MF_all),firstSigNodes=10,useInfo='all')
+printGraph(topGOdata_MF_all, resultFisher_MF_all, firstSigNodes = 10, fn.prefix = c(paste0(prefix_output,"_MF")), useInfo = 'all', pdfSW = TRUE)
+```
+
+
+#### HEATMAP
+```{r}
+library(gplots)
+#install.packages("pheatmap")
+library(pheatmap)
+library("RColorBrewer")
+colors <- colorRampPalette(brewer.pal(9, "YlOrRd"))(5)
+df <- read.table("interesting_GOTerms.txt", header = TRUE)#keywords: wing, imaginal, hippo, ecdysone, insulin, juvenile hormone/JH, population proliferation, alternative splicing
+rownames(df) <- df$GOID
+colnames(df) <- c("5L", "4L")
+df <- subset(df, select = -1 )
+df <- data.matrix(df)
+heatmap.2(df, scale = "none", col = colors, dendrogram = "none",
+          trace = "column", tracecol= "black", vline = 0.05, density.info = "none", offsetRow = 0, cexRow = 0.5, cexCol = 1, margins = c(2,8))
+
+
+pheatmap(df, color = colors, breaks = c(0.05, 0.1, 0.2, 0.3, 0.5, 1), cluster_cols = FALSE, cluster_rows = FALSE,
+         cellwidth = 50, fontsize_row = 8, fontsize_col = 12, angle_col = 0, legend_breaks = c(0.05,0.1,0.2,0.5,1),
+         legend_labels = c("0.05","0.1","0.2","0.5","1"))
+```
+
+
+#### PLOTS
+```{r}
+# We load the results of the GO Enrichment Analysis for the comparison of interest.
+stage="5L"
+type="MF"
+
+object <- read.table(c(paste0("./outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/",stage,"_18-",stage,"_12_",type,"_all_results_edited.txt")))
+
+object <- object[-c(5:6,8,9)] # Eliminates unnecessary columns.
+object <- object[-c(11:20), ] # Retains only top-20 hits.
+
+object$logP <- -log10(object$classicFisher)
+object$Term <- factor(object$Term, levels = rev(object$Term)) # Fixes the order of the rows in the final plot.
+object$Ratio <- object$Significant / object$Annotated
+
+plot <- ggplot(object, aes(x = logP, y = Term, size = Ratio)) +
+  geom_point(shape = 20) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size=6),
+        axis.text.x = element_text(size=12, face = "bold"),
+        axis.title.x = element_text(size = 15, face="bold"),
+        axis.title.y = element_blank(),
+        legend.key.height = unit(0.1, "cm"),
+        legend.key.width = unit(0.01, "cm")) +
+  guides(fill = guide_legend(title = "Genes"), shape = guide_legend(override.aes = list(size = 0.1))) +
+  xlab(bquote(log[10](P))) + 
+  scale_x_continuous(breaks = c(2,4,6,8,10))
+  #geom_vline(xintercept = 1.30, color = "red", linetype = "dashed", linewidth = 0.5)
+  
+plot
+
+ggsave("./outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/i5L_MF.pdf", plot = plot, dpi = 1000, height = 3, width = 5)
+ggsave("./outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/i5L_MF.png", plot = plot, dpi = 1000, height = 3, width = 5)
+```
+
+
+
+#### PLOTS OF REVIGO DE-REDUNDANCY ANALYSIS ####
+```{r}
+#Set working directory.
+setwd("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo")
+
+# Load the data.
+BP_4L <- read.table("/Users/alepa735/Desktop/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/4L-BP-Revigo-output.tsv", header = TRUE, sep = "\t", fileEncoding = "UTF-8")
+MF_4L <- read.table("/Users/alepa735/Desktop/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/4L-MF-Revigo-output.tsv", header = TRUE, sep = "\t", fileEncoding = "UTF-8")
+
+BP_5L <- read.table("/Users/alepa735/Desktop/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/5L-BP-Revigo-output.tsv", header = TRUE, sep = "\t", fileEncoding = "UTF-8")
+MF_5L <- read.table("/Users/alepa735/Desktop/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/5L-MF-Revigo-output.tsv", header = TRUE, sep = "\t", fileEncoding = "UTF-8")
+
+# We remove the most general terms since they are not as interesting. We do that by discarding GO-Terms with "uniqueness" higher than 0.99.
+# We also retain only the 10 hits with the highest 
+BP_4L <- head(BP_4L %>% filter(Uniqueness < 0.99), n = 10)
+MF_4L <- head(MF_4L %>% filter(Uniqueness < 0.99), n = 10)
+BP_5L <- head(BP_5L %>% filter(Uniqueness < 0.99), n = 10)
+MF_5L <- head(MF_5L %>% filter(Uniqueness < 0.99), n = 10)
+
+
+# Now we plot the data.
+BP_4L <- BP_4L %>%
+  mutate(Value = abs(Value)) %>%
+  arrange(Value) %>%
+  mutate(Name = fct_reorder(Name, Value))
+
+# Plot
+plot <- ggplot(BP_4L, aes(y = Name, x = Value)) +
+  geom_point(shape = 20, size = 4) +
+  theme_bw() +
+  scale_size(range = c(1, 6)) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_blank(),
+        legend.position = "none") +
+  xlab(bquote(bold(log[10](p-value)))) +
+  scale_x_reverse()
+  
+plot
+
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/BP_4L_Revigo.pdf", plot = plot, dpi = 1000, height = 4, width = 10)
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/BP_4L_Revigo.png", plot = plot, dpi = 1000, height = 4, width = 10)
+
+
+MF_4L <- MF_4L %>%
+  mutate(Value = abs(Value)) %>%
+  arrange(Value) %>%
+  mutate(Name = fct_reorder(Name, Value))
+
+# Plot
+plot <- ggplot(MF_4L, aes(y = Name, x = Value)) +
+  geom_point(shape = 20, size = 4) +
+  theme_bw() +
+  scale_size(range = c(1, 6)) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_blank(),
+        legend.position = "none") +
+  xlab(bquote(bold(log[10](p-value)))) +
+  scale_x_reverse()
+  
+plot
+
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/MF_4L_Revigo.pdf", plot = plot, dpi = 1000, height = 4, width = 9)
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/MF_4L_Revigo.png", plot = plot, dpi = 1000, height = 4, width = 9)
+
+
+BP_5L <- BP_5L %>%
+  mutate(Value = abs(Value)) %>%
+  arrange(Value) %>%
+  mutate(Name = fct_reorder(Name, Value))
+
+# Plot
+plot <- ggplot(BP_5L, aes(y = Name, x = Value)) +
+  geom_point(shape = 20, size = 4) +
+  theme_bw() +
+  scale_size(range = c(1, 6)) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_blank(),
+        legend.position = "none") +
+  xlab(bquote(bold(log[10](p-value)))) +
+  scale_x_reverse()
+  
+plot
+
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/BP_5L_Revigo.pdf", plot = plot, dpi = 1000, height = 6, width = 8)
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/BP_5L_Revigo.png", plot = plot, dpi = 1000, height = 6, width = 8)
+
+
+MF_5L <- MF_5L %>%
+  mutate(Value = abs(Value)) %>%
+  arrange(Value) %>%
+  mutate(Name = fct_reorder(Name, Value))
+
+# Plot
+plot <- ggplot(MF_5L, aes(y = Name, x = Value)) +
+  geom_point(shape = 20, size = 4) +
+  theme_bw() +
+  scale_size(range = c(1, 6)) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_blank(),
+        legend.position = "none") +
+  xlab(bquote(bold(log[10](p-value)))) +
+  scale_x_reverse()
+  
+plot
+
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/MF_5L_Revigo.pdf", plot = plot, dpi = 1000, height = 6, width = 8)
+ggsave("~/Box Sync/PhD/Research/G.buenoi-DGE/outputs_5_3_cpm_Eric-8-flybasewithcurated_0.01/GO/Revigo/MF_5L_Revigo.png", plot = plot, dpi = 1000, height = 6, width = 8)
+```
+
