@@ -24,7 +24,7 @@ Fat_mean_sd <- data.frame(
 Fat_mean_sd$Treatment <- factor(Fat_mean_sd$Treatment, levels = c("dsGFP","dsFat"))
 
 
-summary(lm(FC~Treatment, data = Fat_data))
+t.test(FC~Treatment, data = Fat_data)
 
 
 ```
@@ -61,7 +61,7 @@ Ds_mean_sd <- data.frame(
 
 Ds_mean_sd$Treatment <- factor(Ds_mean_sd$Treatment, levels = c("dsGFP","dsDs"))
 
-summary(lm(FC~Treatment, data = Ds_data))
+t.test(FC~Treatment, data = Ds_data)
 
 
 ```
@@ -99,7 +99,7 @@ Yki_mean_sd <- data.frame(
 
 Yki_mean_sd$Treatment <- factor(Yki_mean_sd$Treatment, levels = c("dsGFP","dsYki"))
 
-summary(lm(FC~Treatment, data = Yki_data))
+t.test(FC~Treatment, data = Yki_data)
 
 ```
 
@@ -134,7 +134,7 @@ ggsave("./Morphology/knockdowns.pdf", plot = together, dpi = 1000, height = 4, w
 
 RNAi injections
 ```{r}
-Hippo_RNAi <- read_excel("./Morphology/Data_morphology_and_RNAi.xlsx", sheet = "Blad2")
+Hippo_RNAi <- read_excel("Supplemental_Files.xslx", sheet = "Supp File 16", skip = 2, col_names = TRUE)
 Hippo_RNAi$Group <- factor(Hippo_RNAi$Group, levels = c("12:12 dsGFP", "12:12 dsFat", "12:12 dsDachsous", "12:12 dsFat/Dachsous", "12:12 dsYorkie", "12:12 dsScalloped", "12:12 dsDachs"))
 Hippo_plotdata <- Hippo_RNAi %>%
   group_by(Group) %>%

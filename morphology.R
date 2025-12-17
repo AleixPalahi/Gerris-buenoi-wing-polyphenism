@@ -74,11 +74,11 @@ ggsave("./Morphology/wing_body.png", plot = wing_length_fig, dpi = 1000, height 
 
 str(instar5_measurements)
 
-summary(lm(instar5_measurements$WBlength~instar5_measurements$Photoperiod)) 
-#Interpretation: Significant effect of photoperiod on wing bud length. ( B = )
+t.test(instar5_measurements$WBlength~instar5_measurements$Photoperiod)
+t#Interpretation: Significant effect of photoperiod on wing bud length. ( B = )
 
 
-summary(lm(instar5_measurements$TibiaLength~instar5_measurements$Photoperiod)) 
+t.test(instar5_measurements$TibiaLength~instar5_measurements$Photoperiod) 
 
 #Interpretation: No significant effect of photoperiod on tibia length (body size proxy).
 
