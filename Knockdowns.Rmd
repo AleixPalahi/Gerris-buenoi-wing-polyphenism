@@ -1,0 +1,220 @@
+# Load the required packages.
+```{r}
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+```
+
+# Set directory.
+```{r}
+setwd("~/Desktop")
+```
+
+# Load the data for Fat, calculate mean and sd and test for significant knock down. 
+```{r}
+Fat_data <- subset((data.frame(read_excel("Supplemental_Files.xlsx", sheet = "Supp File 18", skip = 2, col_names = TRUE))), Target == "Ft")
+Fat_data$Treatment <- factor(Fat_data$Treatment, levels = c("dsGFP","dsFat"))
+Fat_data
+
+Fat_mean_sd <- data.frame(
+  Mean = c(mean(((subset(Fat_data, Treatment == "dsGFP"))$FC)),mean(((subset(Fat_data, Treatment == "dsFat"))$FC))),
+  SD = c(sd(((subset(Fat_data, Treatment == "dsGFP"))$FC)),sd(((subset(Fat_data, Treatment == "dsFat"))$FC))),
+  Treatment = c("dsGFP","dsFat"))
+
+Fat_mean_sd$Treatment <- factor(Fat_mean_sd$Treatment, levels = c("dsGFP","dsFat"))
+
+
+summary(lm(FC~Treatment, data = Fat_data))
+
+
+```
+
+# Plot the data (Fat).
+```{r}
+Fat_plot <- ggplot(data = Fat_mean_sd, aes(x = Treatment, y = Mean, fill = Treatment)) + 
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size=15),
+        axis.text.x = element_text(size=15, angle = 30),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("gray50", "gray100")) +
+  ylab("Fold change in expression") +
+  theme(legend.position = "none") +
+  geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD), width = 0.15, colour = "black", alpha = 1, linewidth = 0.8) +
+  geom_point(data = Fat_data, aes(y = FC, fill = Treatment), shape = 21, size = 3, position = position_dodge2(width = 0.5), alpha = 0.7)
+
+Fat_plot
+```
+
+# Load the data for Ds, and calculate mean and sd and test for significant knock down. 
+```{r}
+Ds_data <- subset((data.frame(read_excel("Supplemental_Files.xlsx", sheet = "Supp File 18", skip = 2, col_names = TRUE))), Target == "Ds")
+Ds_data$Treatment <- factor(Ds_data$Treatment, levels = c("dsGFP","dsDs"))
+Ds_data
+
+Ds_mean_sd <- data.frame(
+  Mean = c(mean(((subset(Ds_data, Treatment == "dsGFP"))$FC)),mean(((subset(Ds_data, Treatment == "dsDs"))$FC))),
+  SD = c(sd(((subset(Ds_data, Treatment == "dsGFP"))$FC)),sd(((subset(Ds_data, Treatment == "dsDs"))$FC))),
+  Treatment = c("dsGFP","dsDs"))
+
+Ds_mean_sd$Treatment <- factor(Ds_mean_sd$Treatment, levels = c("dsGFP","dsDs"))
+
+summary(lm(FC~Treatment, data = Ds_data))
+
+
+```
+
+# Plot the data (Ds).
+```{r}
+Ds_plot <- ggplot(data = Ds_mean_sd, aes(x = Treatment, y = Mean, fill = Treatment)) + 
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size=15),
+        axis.text.x = element_text(size=15, angle = 30),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("gray50", "gray100")) +
+  xlab("") + ylab("Fold change in expression") +
+  theme(legend.position = "none") +
+  geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD), width = 0.15, colour = "black", alpha = 1, size = 0.8) +
+  geom_point(data = Ds_data, aes(y = FC, fill = Treatment), shape = 21, size = 3, position = position_dodge2(width = 0.5), alpha = 0.7)
+
+Ds_plot
+```
+
+
+# Load the data for Yki, and calculate mean and sd and test for significant knock down. 
+```{r}
+Yki_data <- subset((data.frame(read_excel("Supplemental_Files.xlsx", sheet = "Supp File 18", skip = 2, col_names = TRUE))), Target == "Yki")
+Yki_data$Treatment <- factor(Yki_data$Treatment, levels = c("dsGFP","dsYki"))
+Yki_data
+
+Yki_mean_sd <- data.frame(
+  Mean = c(mean(((subset(Yki_data, Treatment == "dsGFP"))$FC)),mean(((subset(Yki_data, Treatment == "dsYki"))$FC))),
+  SD = c(sd(((subset(Yki_data, Treatment == "dsGFP"))$FC)),sd(((subset(Yki_data, Treatment == "dsYki"))$FC))),
+  Treatment = c("dsGFP","dsYki"))
+
+Yki_mean_sd$Treatment <- factor(Yki_mean_sd$Treatment, levels = c("dsGFP","dsYki"))
+
+summary(lm(FC~Treatment, data = Yki_data))
+
+```
+
+# Plot the data (Yki).
+```{r}
+Yki_plot <- ggplot(data = Yki_mean_sd, aes(x = Treatment, y = Mean, fill = Treatment)) + 
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(size=15),
+        axis.text.x = element_text(size=15, angle = 30),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("gray50", "gray100")) +
+  xlab("") + ylab("Fold change in expression") +
+  theme(legend.position = "none") +
+  geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD), width = 0.15, colour = "black", alpha = 1, size = 0.8) +
+  geom_point(data = Yki_data, aes(y = FC, fill = Treatment), shape = 21, size = 3, position = position_dodge2(width = 0.5), alpha = 0.7)
+
+Yki_plot
+```
+
+# Plots arranged. 
+```{r}
+library(gridExtra)
+together <- grid.arrange(Fat_plot, Ds_plot, Yki_plot, nrow = 1)
+ggsave("./Morphology/knockdowns.png", plot = together, dpi = 1000, height = 4, width = 5)
+ggsave("./Morphology/knockdowns.pdf", plot = together, dpi = 1000, height = 4, width = 5)
+```
+
+
+
+RNAi injections
+```{r}
+Hippo_RNAi <- read_excel("./Morphology/Data_morphology_and_RNAi.xlsx", sheet = "Blad2")
+Hippo_RNAi$Group <- factor(Hippo_RNAi$Group, levels = c("12:12 dsGFP", "12:12 dsFat", "12:12 dsDachsous", "12:12 dsFat/Dachsous", "12:12 dsYorkie", "12:12 dsScalloped", "12:12 dsDachs"))
+Hippo_plotdata <- Hippo_RNAi %>%
+  group_by(Group) %>%
+  mutate(Total = sum(Number_adults),
+         Prop = Number_adults / Total) %>%
+  filter(Morph %in% c("Me", "Mi"))
+
+Hippo_RNAi_fig_mod <- ggplot(Hippo_plotdata, 
+                         aes(x = Group, y = Prop, 
+                             fill = factor(Morph, levels = c("Me", "Mi")))) +
+  geom_col(width = 0.6, color = "grey1") +
+  theme_classic() +
+  scale_fill_manual(values = c("gray50","gray90"),
+                    labels = c("Mesopterous", "Micropterous")  # custom legend labels
+  )+
+  scale_y_continuous(labels = scales::percent_format(),
+                     breaks = c(0,0.05,0.10,0.15,0.20,0.25)) +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 8, face = "bold"),
+        legend.position = "top",
+        legend.key.size = unit(1.2,"line"),
+        axis.text.x = element_text(size = 8, angle = 45, hjust = TRUE, colour = "grey1"),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size=10, colour = "grey1"),
+        axis.title.y = element_blank()) +
+  geom_text(data = distinct(Hippo_plotdata, Group, Total),
+            aes(x = Group, y = 0.25, label = Total),
+            inherit.aes = FALSE,
+            size = 3)
+
+Hippo_RNAi_fig_mod
+
+ggsave("./Morphology/RNAi_injections.png", Hippo_RNAi_fig_mod, height = 3, width = 4, units = "in", dpi = 600)
+ggsave("./Morphology/RNAi_injections.pdf", Hippo_RNAi_fig_mod, height = 3, width = 4, units = "in", dpi = 600)
+```
+
+
+RNAi Statistical analysis
+
+```{r}
+
+Hippo_RNAi_test <- read_excel("~/Desktop/Supplemental_Files.xlsx", sheet = "Supp File 16", skip = 2, col_names = TRUE) # Loading the data
+
+#Arranging data for chisquare test, summarizing non macropterous (mesopterous and micropterous) and macropterous. 
+non_macropterous <- c()
+for (i in unique(Hippo_RNAi_test$Treatment)) {
+  total_non_ma <- sum((subset(Hippo_RNAi_test, Treatment == i & Morph %in% c("Me", "Mi")))$Number_adults)
+  non_macropterous <- c(non_macropterous, total_non_ma)
+}
+
+macropterous <- c()
+for (i in unique(Hippo_RNAi_test$Treatment)) {
+  total_ma <- sum((subset(Hippo_RNAi_test, Treatment == i & Morph == "Ma"))$Number_adults)
+  macropterous <- c(macropterous, total_ma)
+}
+
+Hippo_RNAi_test_DF <- as.data.frame(cbind(non_macropterous,macropterous))
+Hippo_RNAi_test_DF$Treatment <- unique(Hippo_RNAi_test$Treatment)
+Hippo_RNAi_test_DF
+str(Hippo_RNAi_test_DF)
+
+
+rownames(Hippo_RNAi_test_DF) <- c("12:12 dsGFP", "12:12 dsYorkie", "12:12 dsDachsous","12:12 dsFat","12:12 dsDachs","12:12 dsScalloped", "12:12 dsFat/Dachsous")
+
+chisq.test(Hippo_RNAi_test_DF[c(1,2), c("non_macropterous","macropterous")]) ## GFP vs. Yorkie
+chisq.test(Hippo_RNAi_test_DF[c(1,3), c("non_macropterous","macropterous")]) ## GFP vs. Ds
+chisq.test(Hippo_RNAi_test_DF[c(1,4), c("non_macropterous","macropterous")]) ## GFP vs. Fat
+chisq.test(Hippo_RNAi_test_DF[c(1,5), c("non_macropterous","macropterous")]) ## GFP vs. Dachs
+chisq.test(Hippo_RNAi_test_DF[c(1,6), c("non_macropterous","macropterous")]) ## GFP vs. Sd
+chisq.test(Hippo_RNAi_test_DF[c(1,7), c("non_macropterous","macropterous")]) ## GFP vs. Fat/Dachsous 
+
+fisher.test(Hippo_RNAi_test_DF[c(1, 2), c("non_macropterous","macropterous")]) ## GFP vs. Yorkie
+fisher.test(Hippo_RNAi_test_DF[c(1, 3), c("non_macropterous","macropterous")]) ## GFP vs. Ds
+fisher.test(Hippo_RNAi_test_DF[c(1, 4), c("non_macropterous","macropterous")]) ## GFP vs. Fat
+fisher.test(Hippo_RNAi_test_DF[c(1, 5), c("non_macropterous","macropterous")]) ## GFP vs. Dachs 
+fisher.test(Hippo_RNAi_test_DF[c(1, 6), c("non_macropterous","macropterous")]) ## GFP vs. Sd
+fisher.test(Hippo_RNAi_test_DF[c(1, 7), c("non_macropterous","macropterous")]) ## GFP vs. Fat/Dachsous
+
+```
+
+
+
+
